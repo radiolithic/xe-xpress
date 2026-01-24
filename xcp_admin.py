@@ -243,10 +243,15 @@ CREATE TABLE IF NOT EXISTS srs (
     uuid TEXT PRIMARY KEY,
     host_address TEXT,
     name_label TEXT,
+    name_description TEXT,
     type TEXT,
+    content_type TEXT,
     physical_size INTEGER,
     physical_utilisation INTEGER,
     shared INTEGER,
+    device_config TEXT,
+    sm_config TEXT,
+    other_config TEXT,
     FOREIGN KEY (host_address) REFERENCES sync_info(host_address)
 );
 """
@@ -256,6 +261,19 @@ def init_database(db_path=DB_FILE):
     """Create database schema if not exists."""
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
+    # Migrate: add new SR columns if they don't exist
+    cursor = conn.execute("PRAGMA table_info(srs)")
+    columns = {row[1] for row in cursor.fetchall()}
+    migrations = [
+        ('name_description', 'TEXT'),
+        ('content_type', 'TEXT'),
+        ('device_config', 'TEXT'),
+        ('sm_config', 'TEXT'),
+        ('other_config', 'TEXT'),
+    ]
+    for col_name, col_type in migrations:
+        if col_name not in columns:
+            conn.execute(f"ALTER TABLE srs ADD COLUMN {col_name} {col_type}")
     conn.commit()
     conn.close()
 
@@ -279,229 +297,181 @@ def sync_host_to_cache(api_conn, host_address, host_name):
     """Full sync from single XenAPI host to SQLite.
 
     Fetches all infrastructure data from the XenAPI and stores it in SQLite.
+    Uses INSERT OR REPLACE to handle objects that may exist across multiple hosts.
     """
     start_time = time.time()
     db = get_db()
 
-    print(f"  Syncing data from {host_name}...")
+    try:
+        print(f"  Syncing data from {host_name}...")
 
-    # Clear existing data for this host
-    clear_host_data(db, host_address)
+        # Clear existing data for this host
+        clear_host_data(db, host_address)
 
-    api = api_conn.api
+        api = api_conn.api
 
-    # Sync hosts
-    print("    - Hosts...", end=" ", flush=True)
-    host_records = api.host.get_all_records()
-    for ref, rec in host_records.items():
-        # Get metrics for memory info
-        metrics_ref = rec.get('metrics', 'OpaqueRef:NULL')
-        memory_total = 0
-        memory_free = 0
-        metrics_live = 0
-        if metrics_ref != 'OpaqueRef:NULL':
-            try:
-                metrics = api.host_metrics.get_record(metrics_ref)
-                memory_total = int(metrics.get('memory_total', 0))
-                memory_free = int(metrics.get('memory_free', 0))
-                metrics_live = 1 if metrics.get('live', False) else 0
-            except:
-                pass
+        # Sync hosts
+        print("    - Hosts...", end=" ", flush=True)
+        host_records = api.host.get_all_records()
+        for ref, rec in host_records.items():
+            metrics_ref = rec.get('metrics', 'OpaqueRef:NULL')
+            memory_total = memory_free = metrics_live = 0
+            if metrics_ref != 'OpaqueRef:NULL':
+                try:
+                    metrics = api.host_metrics.get_record(metrics_ref)
+                    memory_total = int(metrics.get('memory_total', 0))
+                    memory_free = int(metrics.get('memory_free', 0))
+                    metrics_live = 1 if metrics.get('live', False) else 0
+                except:
+                    pass
+            db.execute("""
+                INSERT OR REPLACE INTO hosts (uuid, host_address, name_label, hostname,
+                    address, enabled, software_version, cpu_info, memory_total,
+                    memory_free, metrics_live)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (rec['uuid'], host_address, rec.get('name_label', ''),
+                  rec.get('hostname', ''), rec.get('address', ''),
+                  1 if rec.get('enabled', False) else 0,
+                  json.dumps(rec.get('software_version', {})),
+                  json.dumps(rec.get('cpu_info', {})),
+                  memory_total, memory_free, metrics_live))
+        print(f"{len(host_records)} found")
 
+        # Sync VMs
+        print("    - VMs...", end=" ", flush=True)
+        vm_records = api.VM.get_all_records()
+        for ref, rec in vm_records.items():
+            resident_on_uuid = None
+            resident_ref = rec.get('resident_on', 'OpaqueRef:NULL')
+            if resident_ref != 'OpaqueRef:NULL' and resident_ref in host_records:
+                resident_on_uuid = host_records[resident_ref]['uuid']
+            snapshot_of_uuid = None
+            snapshot_of_ref = rec.get('snapshot_of', 'OpaqueRef:NULL')
+            if snapshot_of_ref != 'OpaqueRef:NULL':
+                try:
+                    snapshot_of_uuid = api.VM.get_uuid(snapshot_of_ref)
+                except:
+                    pass
+            snapshot_time = rec.get('snapshot_time')
+            if hasattr(snapshot_time, 'value'):
+                snapshot_time = str(snapshot_time.value)
+            else:
+                snapshot_time = str(snapshot_time) if snapshot_time else None
+            db.execute("""
+                INSERT OR REPLACE INTO vms (uuid, host_address, name_label, name_description,
+                    power_state, vcpus_max, memory_static_max, is_template, is_control_domain,
+                    is_snapshot, snapshot_of_uuid, snapshot_time, resident_on_uuid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (rec['uuid'], host_address, rec.get('name_label', ''),
+                  rec.get('name_description', ''), rec.get('power_state', ''),
+                  int(rec.get('VCPUs_max', 0)), int(rec.get('memory_static_max', 0)),
+                  1 if rec.get('is_a_template', False) else 0,
+                  1 if rec.get('is_control_domain', False) else 0,
+                  1 if rec.get('is_a_snapshot', False) else 0,
+                  snapshot_of_uuid, snapshot_time, resident_on_uuid))
+        print(f"{len(vm_records)} found")
+
+        # Sync SRs
+        print("    - Storage repositories...", end=" ", flush=True)
+        sr_records = api.SR.get_all_records()
+        for ref, rec in sr_records.items():
+            db.execute("""
+                INSERT OR REPLACE INTO srs (uuid, host_address, name_label, name_description,
+                    type, content_type, physical_size, physical_utilisation, shared,
+                    device_config, sm_config, other_config)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (rec['uuid'], host_address, rec.get('name_label', ''),
+                  rec.get('name_description', ''), rec.get('type', ''),
+                  rec.get('content_type', ''), int(rec.get('physical_size', 0)),
+                  int(rec.get('physical_utilisation', 0)),
+                  1 if rec.get('shared', False) else 0,
+                  json.dumps(rec.get('device_config', {})),
+                  json.dumps(rec.get('sm_config', {})),
+                  json.dumps(rec.get('other_config', {}))))
+        print(f"{len(sr_records)} found")
+
+        # Sync VDIs
+        print("    - Virtual disks...", end=" ", flush=True)
+        vdi_records = api.VDI.get_all_records()
+        for ref, rec in vdi_records.items():
+            sr_uuid = None
+            sr_ref = rec.get('SR', 'OpaqueRef:NULL')
+            if sr_ref != 'OpaqueRef:NULL' and sr_ref in sr_records:
+                sr_uuid = sr_records[sr_ref]['uuid']
+            db.execute("""
+                INSERT OR REPLACE INTO vdis (uuid, host_address, name_label,
+                    virtual_size, physical_utilisation, sr_uuid)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (rec['uuid'], host_address, rec.get('name_label', ''),
+                  int(rec.get('virtual_size', 0)),
+                  int(rec.get('physical_utilisation', 0)), sr_uuid))
+        print(f"{len(vdi_records)} found")
+
+        # Sync VBDs
+        print("    - Virtual block devices...", end=" ", flush=True)
+        vbd_records = api.VBD.get_all_records()
+        for ref, rec in vbd_records.items():
+            vm_uuid = None
+            vm_ref = rec.get('VM', 'OpaqueRef:NULL')
+            if vm_ref != 'OpaqueRef:NULL' and vm_ref in vm_records:
+                vm_uuid = vm_records[vm_ref]['uuid']
+            vdi_uuid = None
+            vdi_ref = rec.get('VDI', 'OpaqueRef:NULL')
+            if vdi_ref != 'OpaqueRef:NULL' and vdi_ref in vdi_records:
+                vdi_uuid = vdi_records[vdi_ref]['uuid']
+            db.execute("""
+                INSERT OR REPLACE INTO vbds (uuid, host_address, vm_uuid, vdi_uuid,
+                    device, bootable, type)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (rec['uuid'], host_address, vm_uuid, vdi_uuid,
+                  rec.get('device', ''), 1 if rec.get('bootable', False) else 0,
+                  rec.get('type', '')))
+        print(f"{len(vbd_records)} found")
+
+        # Sync Networks
+        print("    - Networks...", end=" ", flush=True)
+        net_records = api.network.get_all_records()
+        for ref, rec in net_records.items():
+            db.execute("""
+                INSERT OR REPLACE INTO networks (uuid, host_address, name_label, bridge)
+                VALUES (?, ?, ?, ?)
+            """, (rec['uuid'], host_address, rec.get('name_label', ''),
+                  rec.get('bridge', '')))
+        print(f"{len(net_records)} found")
+
+        # Sync VIFs
+        print("    - Virtual interfaces...", end=" ", flush=True)
+        vif_records = api.VIF.get_all_records()
+        for ref, rec in vif_records.items():
+            vm_uuid = None
+            vm_ref = rec.get('VM', 'OpaqueRef:NULL')
+            if vm_ref != 'OpaqueRef:NULL' and vm_ref in vm_records:
+                vm_uuid = vm_records[vm_ref]['uuid']
+            network_uuid = None
+            net_ref = rec.get('network', 'OpaqueRef:NULL')
+            if net_ref != 'OpaqueRef:NULL' and net_ref in net_records:
+                network_uuid = net_records[net_ref]['uuid']
+            db.execute("""
+                INSERT OR REPLACE INTO vifs (uuid, host_address, vm_uuid, network_uuid,
+                    device, mac)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (rec['uuid'], host_address, vm_uuid, network_uuid,
+                  rec.get('device', ''), rec.get('MAC', '')))
+        print(f"{len(vif_records)} found")
+
+        # Update sync info
+        duration_ms = int((time.time() - start_time) * 1000)
         db.execute("""
-            INSERT INTO hosts (uuid, host_address, name_label, hostname, address,
-                             enabled, software_version, cpu_info, memory_total,
-                             memory_free, metrics_live)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            rec['uuid'],
-            host_address,
-            rec.get('name_label', ''),
-            rec.get('hostname', ''),
-            rec.get('address', ''),
-            1 if rec.get('enabled', False) else 0,
-            json.dumps(rec.get('software_version', {})),
-            json.dumps(rec.get('cpu_info', {})),
-            memory_total,
-            memory_free,
-            metrics_live
-        ))
-    print(f"{len(host_records)} found")
+            INSERT OR REPLACE INTO sync_info (host_address, host_name, last_sync, sync_duration_ms)
+            VALUES (?, ?, datetime('now'), ?)
+        """, (host_address, host_name, duration_ms))
 
-    # Sync VMs
-    print("    - VMs...", end=" ", flush=True)
-    vm_records = api.VM.get_all_records()
-    for ref, rec in vm_records.items():
-        # Get resident_on UUID
-        resident_on_uuid = None
-        resident_ref = rec.get('resident_on', 'OpaqueRef:NULL')
-        if resident_ref != 'OpaqueRef:NULL' and resident_ref in host_records:
-            resident_on_uuid = host_records[resident_ref]['uuid']
+        db.commit()
+        print(f"  Sync complete ({duration_ms}ms)")
+        log_operation("CACHE_SYNC", f"Synced {host_name} ({host_address}) in {duration_ms}ms")
 
-        # Get snapshot_of UUID
-        snapshot_of_uuid = None
-        snapshot_of_ref = rec.get('snapshot_of', 'OpaqueRef:NULL')
-        if snapshot_of_ref != 'OpaqueRef:NULL':
-            try:
-                snapshot_of_uuid = api.VM.get_uuid(snapshot_of_ref)
-            except:
-                pass
-
-        snapshot_time = rec.get('snapshot_time')
-        if hasattr(snapshot_time, 'value'):
-            snapshot_time = str(snapshot_time.value)
-        else:
-            snapshot_time = str(snapshot_time) if snapshot_time else None
-
-        db.execute("""
-            INSERT INTO vms (uuid, host_address, name_label, name_description,
-                           power_state, vcpus_max, memory_static_max, is_template,
-                           is_control_domain, is_snapshot, snapshot_of_uuid,
-                           snapshot_time, resident_on_uuid)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            rec['uuid'],
-            host_address,
-            rec.get('name_label', ''),
-            rec.get('name_description', ''),
-            rec.get('power_state', ''),
-            int(rec.get('VCPUs_max', 0)),
-            int(rec.get('memory_static_max', 0)),
-            1 if rec.get('is_a_template', False) else 0,
-            1 if rec.get('is_control_domain', False) else 0,
-            1 if rec.get('is_a_snapshot', False) else 0,
-            snapshot_of_uuid,
-            snapshot_time,
-            resident_on_uuid
-        ))
-    print(f"{len(vm_records)} found")
-
-    # Sync SRs
-    print("    - Storage repositories...", end=" ", flush=True)
-    sr_records = api.SR.get_all_records()
-    for ref, rec in sr_records.items():
-        db.execute("""
-            INSERT INTO srs (uuid, host_address, name_label, type,
-                           physical_size, physical_utilisation, shared)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            rec['uuid'],
-            host_address,
-            rec.get('name_label', ''),
-            rec.get('type', ''),
-            int(rec.get('physical_size', 0)),
-            int(rec.get('physical_utilisation', 0)),
-            1 if rec.get('shared', False) else 0
-        ))
-    print(f"{len(sr_records)} found")
-
-    # Sync VDIs
-    print("    - Virtual disks...", end=" ", flush=True)
-    vdi_records = api.VDI.get_all_records()
-    for ref, rec in vdi_records.items():
-        sr_uuid = None
-        sr_ref = rec.get('SR', 'OpaqueRef:NULL')
-        if sr_ref != 'OpaqueRef:NULL' and sr_ref in sr_records:
-            sr_uuid = sr_records[sr_ref]['uuid']
-
-        db.execute("""
-            INSERT INTO vdis (uuid, host_address, name_label, virtual_size,
-                            physical_utilisation, sr_uuid)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            rec['uuid'],
-            host_address,
-            rec.get('name_label', ''),
-            int(rec.get('virtual_size', 0)),
-            int(rec.get('physical_utilisation', 0)),
-            sr_uuid
-        ))
-    print(f"{len(vdi_records)} found")
-
-    # Sync VBDs
-    print("    - Virtual block devices...", end=" ", flush=True)
-    vbd_records = api.VBD.get_all_records()
-    for ref, rec in vbd_records.items():
-        vm_uuid = None
-        vm_ref = rec.get('VM', 'OpaqueRef:NULL')
-        if vm_ref != 'OpaqueRef:NULL' and vm_ref in vm_records:
-            vm_uuid = vm_records[vm_ref]['uuid']
-
-        vdi_uuid = None
-        vdi_ref = rec.get('VDI', 'OpaqueRef:NULL')
-        if vdi_ref != 'OpaqueRef:NULL' and vdi_ref in vdi_records:
-            vdi_uuid = vdi_records[vdi_ref]['uuid']
-
-        db.execute("""
-            INSERT INTO vbds (uuid, host_address, vm_uuid, vdi_uuid,
-                            device, bootable, type)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            rec['uuid'],
-            host_address,
-            vm_uuid,
-            vdi_uuid,
-            rec.get('device', ''),
-            1 if rec.get('bootable', False) else 0,
-            rec.get('type', '')
-        ))
-    print(f"{len(vbd_records)} found")
-
-    # Sync Networks
-    print("    - Networks...", end=" ", flush=True)
-    net_records = api.network.get_all_records()
-    for ref, rec in net_records.items():
-        db.execute("""
-            INSERT INTO networks (uuid, host_address, name_label, bridge)
-            VALUES (?, ?, ?, ?)
-        """, (
-            rec['uuid'],
-            host_address,
-            rec.get('name_label', ''),
-            rec.get('bridge', '')
-        ))
-    print(f"{len(net_records)} found")
-
-    # Sync VIFs
-    print("    - Virtual interfaces...", end=" ", flush=True)
-    vif_records = api.VIF.get_all_records()
-    for ref, rec in vif_records.items():
-        vm_uuid = None
-        vm_ref = rec.get('VM', 'OpaqueRef:NULL')
-        if vm_ref != 'OpaqueRef:NULL' and vm_ref in vm_records:
-            vm_uuid = vm_records[vm_ref]['uuid']
-
-        network_uuid = None
-        net_ref = rec.get('network', 'OpaqueRef:NULL')
-        if net_ref != 'OpaqueRef:NULL' and net_ref in net_records:
-            network_uuid = net_records[net_ref]['uuid']
-
-        db.execute("""
-            INSERT INTO vifs (uuid, host_address, vm_uuid, network_uuid,
-                            device, mac)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            rec['uuid'],
-            host_address,
-            vm_uuid,
-            network_uuid,
-            rec.get('device', ''),
-            rec.get('MAC', '')
-        ))
-    print(f"{len(vif_records)} found")
-
-    # Update sync info
-    duration_ms = int((time.time() - start_time) * 1000)
-    db.execute("""
-        INSERT OR REPLACE INTO sync_info (host_address, host_name, last_sync, sync_duration_ms)
-        VALUES (?, ?, datetime('now'), ?)
-    """, (host_address, host_name, duration_ms))
-
-    db.commit()
-    db.close()
-
-    print(f"  ✓ Sync complete ({duration_ms}ms)")
-    log_operation("CACHE_SYNC", f"Synced {host_name} ({host_address}) in {duration_ms}ms")
+    finally:
+        db.close()
 
 
 # ============================================================================
@@ -552,22 +522,25 @@ class XCPConnection:
 def select_server(servers):
     """Interactive server selection from config.
 
-    Returns selected server dict or None.
+    Returns selected server dict or None to exit.
     """
     if not servers:
         return None
 
-    print("\n  Available servers:")
+    print(f"\n{'─' * 60}")
+    print("  Select Server")
+    print('─' * 60)
     print(f"  {'#':<4} {'Name':<15} {'Address'}")
     print('  ' + '-' * 40)
 
     for i, s in enumerate(servers, 1):
         print(f"  {i:<4} {s['name']:<15} {s['address']}")
 
-    print("\nEnter server number (or 'q' to quit):")
-    choice = input("Select server: ").strip()
+    print(f"  [x] Exit")
+    print('─' * 60)
+    choice = input("Select: ").strip()
 
-    if choice.lower() == 'q':
+    if choice.lower() == 'x':
         return None
 
     try:
@@ -613,20 +586,25 @@ def format_power_state(state):
     return f"{indicators.get(state, '❓')} {state}"
 
 
-def display_menu(title, options, show_back=True, show_quit=True):
-    """Display a menu and get user choice."""
+def display_menu(title, options, show_quit=True, show_exit=True):
+    """Display a menu and get user choice.
+
+    Navigation convention:
+        [q] Quit - go back/up one level
+        [x] Exit - exit program completely
+    """
     print(f"\n{'─' * 60}")
     print(f"  {title}")
     print('─' * 60)
-    
+
     for key, label in options:
         print(f"  [{key}] {label}")
-    
-    if show_back:
-        print(f"  [b] Back")
+
     if show_quit:
         print(f"  [q] Quit")
-    
+    if show_exit:
+        print(f"  [x] Exit")
+
     print('─' * 60)
     return input("Select: ").strip().lower()
 
@@ -635,14 +613,14 @@ def display_menu(title, options, show_back=True, show_quit=True):
 # VM OPERATIONS
 # ============================================================================
 
-def list_vms(conn, include_templates=False, include_control=False):
+def list_vms(conn, include_templates=False, include_control=False, include_snapshots=False):
     """
     Get list of VMs with basic info.
     Returns list of dicts with vm_ref, name, power_state, etc.
     """
     vms = []
     all_vms = conn.api.VM.get_all_records()
-    
+
     for ref, rec in all_vms.items():
         # Skip templates unless requested
         if rec['is_a_template'] and not include_templates:
@@ -650,7 +628,10 @@ def list_vms(conn, include_templates=False, include_control=False):
         # Skip control domains (dom0) unless requested
         if rec['is_control_domain'] and not include_control:
             continue
-        
+        # Skip snapshots unless requested
+        if rec.get('is_a_snapshot', False) and not include_snapshots:
+            continue
+
         vms.append({
             'ref': ref,
             'uuid': rec['uuid'],
@@ -658,9 +639,10 @@ def list_vms(conn, include_templates=False, include_control=False):
             'power_state': rec['power_state'],
             'vcpus': rec['VCPUs_max'],
             'memory': rec['memory_static_max'],
-            'description': rec['name_description']
+            'description': rec['name_description'],
+            'snapshots': len(rec.get('snapshots', []))
         })
-    
+
     # Sort by name
     vms.sort(key=lambda x: x['name'].lower())
     return vms
@@ -668,31 +650,45 @@ def list_vms(conn, include_templates=False, include_control=False):
 
 def display_vm_list(vms):
     """Display formatted VM list."""
-    print(f"\n{'#':<4} {'Name':<25} {'State':<15} {'vCPUs':<6} {'Memory':<10}")
-    print('─' * 70)
-    
+    print(f"\n{'#':<4} {'Name':<25} {'State':<15} {'vCPUs':<6} {'Mem':<8} {'Snaps':<5}")
+    print('─' * 72)
+
     for i, vm in enumerate(vms, 1):
         state = format_power_state(vm['power_state'])
         mem = format_size(vm['memory'])
-        print(f"{i:<4} {vm['name']:<25} {state:<15} {vm['vcpus']:<6} {mem:<10}")
+        snaps = vm.get('snapshots', 0)
+        snap_str = str(snaps) if snaps > 0 else '-'
+        print(f"{i:<4} {vm['name']:<25} {state:<15} {vm['vcpus']:<6} {mem:<8} {snap_str:<5}")
 
 
 def select_vm(conn):
-    """Interactive VM selection."""
+    """Interactive VM selection.
+
+    Returns:
+        (vm_ref, vm_info) - selected VM
+        (None, None) - user chose quit (go back)
+        ('exit', None) - user chose exit program
+    """
     vms = list_vms(conn)
-    
+
     if not vms:
-        print("\n❌ No VMs found on this host.")
+        print("\nNo VMs found on this host.")
         return None, None
-    
+
+    print(f"\n{'─' * 60}")
+    print("  Select VM")
+    print('─' * 60)
     display_vm_list(vms)
-    
-    print("\nEnter VM number, name, or 'q' to quit:")
+
+    print(f"\n  [q] Quit    [x] Exit")
+    print('─' * 60)
     choice = input("Select VM: ").strip()
-    
+
     if choice.lower() == 'q':
         return None, None
-    
+    if choice.lower() == 'x':
+        return 'exit', None
+
     # Try as number first
     try:
         idx = int(choice) - 1
@@ -700,13 +696,13 @@ def select_vm(conn):
             return vms[idx]['ref'], vms[idx]
     except ValueError:
         pass
-    
+
     # Try as name (partial match)
     for vm in vms:
         if choice.lower() in vm['name'].lower():
             return vm['ref'], vm
-    
-    print(f"\n❌ VM not found: {choice}")
+
+    print(f"\nVM not found: {choice}")
     return None, None
 
 
@@ -1350,6 +1346,249 @@ def display_host_overview(conn):
 
 
 # ============================================================================
+# STORAGE OVERVIEW
+# ============================================================================
+
+def get_storage_repositories(host_address):
+    """Get all SRs from cache for a host."""
+    db = get_db()
+    rows = db.execute("""
+        SELECT * FROM srs WHERE host_address = ? ORDER BY name_label
+    """, (host_address,)).fetchall()
+    db.close()
+    return [dict(row) for row in rows]
+
+
+def display_storage_list(srs):
+    """Display compact SR list."""
+    print(f"\n  {'#':<3} {'Name':<25} {'Type':<10} {'Used':<10} {'Total':<10} {'Shared'}")
+    print('  ' + '-' * 70)
+
+    for i, sr in enumerate(srs, 1):
+        used = format_size(sr['physical_utilisation'])
+        total = format_size(sr['physical_size']) if sr['physical_size'] else '-'
+        shared = 'Yes' if sr['shared'] else 'No'
+        name = sr['name_label'][:24] if len(sr['name_label']) > 24 else sr['name_label']
+        print(f"  {i:<3} {name:<25} {sr['type']:<10} {used:<10} {total:<10} {shared}")
+
+
+def display_sr_details(sr):
+    """Display detailed SR information."""
+    print(f"\n{'=' * 64}")
+    print(f"  SR: {sr['name_label']}")
+    print(f"{'=' * 64}")
+
+    print(f"  UUID:        {sr['uuid']}")
+    print(f"  Type:        {sr['type']}")
+    print(f"  Description: {sr['name_description'] or '(none)'}")
+    print(f"  Content:     {sr['content_type'] or '(none)'}")
+    print(f"  Shared:      {'Yes' if sr['shared'] else 'No'}")
+
+    used = format_size(sr['physical_utilisation'])
+    total = format_size(sr['physical_size']) if sr['physical_size'] else 'Unknown'
+    print(f"  Used:        {used}")
+    print(f"  Total:       {total}")
+
+    # Device config (contains NFS server/path, etc.)
+    device_config = json.loads(sr.get('device_config', '{}') or '{}')
+    if device_config:
+        print(f"\n  Device Config:")
+        for key, val in device_config.items():
+            print(f"    {key}: {val}")
+
+    # SM config
+    sm_config = json.loads(sr.get('sm_config', '{}') or '{}')
+    if sm_config:
+        print(f"\n  SM Config:")
+        for key, val in sm_config.items():
+            print(f"    {key}: {val}")
+
+
+def get_sr_create_command(sr):
+    """Generate xe command to recreate this SR on another host."""
+    device_config = json.loads(sr.get('device_config', '{}') or '{}')
+    sm_config = json.loads(sr.get('sm_config', '{}') or '{}')
+
+    sr_type = sr['type']
+    name = sr['name_label']
+    desc = sr['name_description'] or ''
+
+    # Build device-config params
+    dc_params = ' '.join(f"device-config:{k}={v}" for k, v in device_config.items())
+    sm_params = ' '.join(f"sm-config:{k}={v}" for k, v in sm_config.items())
+
+    # Base command
+    cmd = f"xe sr-create name-label=\"{name}\""
+    if desc:
+        cmd += f" name-description=\"{desc}\""
+    cmd += f" type={sr_type} shared={'true' if sr['shared'] else 'false'}"
+    if sr['content_type']:
+        cmd += f" content-type={sr['content_type']}"
+    if dc_params:
+        cmd += f" {dc_params}"
+    if sm_params:
+        cmd += f" {sm_params}"
+
+    return cmd
+
+
+def get_sr_create_script(sr, target_servers=None):
+    """Generate a shell script to create this SR on multiple servers."""
+    device_config = json.loads(sr.get('device_config', '{}') or '{}')
+
+    lines = ["#!/bin/bash", "# Auto-generated script to create SR on XCP-ng hosts", ""]
+    lines.append(f"SR_NAME=\"{sr['name_label']}\"")
+    lines.append(f"SR_DESC=\"{sr['name_description'] or ''}\"")
+    lines.append(f"SR_TYPE=\"{sr['type']}\"")
+    lines.append(f"SR_SHARED=\"{'true' if sr['shared'] else 'false'}\"")
+
+    if sr['content_type']:
+        lines.append(f"SR_CONTENT=\"{sr['content_type']}\"")
+
+    # Add device config as variables
+    for key, val in device_config.items():
+        var_name = f"DC_{key.upper().replace('-', '_').replace(':', '_')}"
+        lines.append(f"{var_name}=\"{val}\"")
+
+    lines.append("")
+    lines.append("# Target hosts (edit as needed)")
+
+    if target_servers:
+        lines.append(f"HOSTS=({' '.join(target_servers)})")
+    else:
+        lines.append("HOSTS=(xcpng01 xcpng02 xcpng03)")
+
+    lines.append("")
+    lines.append("for HOST in \"${HOSTS[@]}\"; do")
+    lines.append("    echo \"Creating SR on $HOST...\"")
+
+    # Build xe command
+    cmd_parts = ["    xe sr-create"]
+    cmd_parts.append("        name-label=\"$SR_NAME\"")
+    cmd_parts.append("        name-description=\"$SR_DESC\"")
+    cmd_parts.append("        type=$SR_TYPE")
+    cmd_parts.append("        shared=$SR_SHARED")
+
+    if sr['content_type']:
+        cmd_parts.append("        content-type=$SR_CONTENT")
+
+    for key, val in device_config.items():
+        var_name = f"DC_{key.upper().replace('-', '_').replace(':', '_')}"
+        cmd_parts.append(f"        device-config:{key}=\"${var_name}\"")
+
+    lines.append(" \\\n".join(cmd_parts))
+    lines.append("done")
+
+    return "\n".join(lines)
+
+
+def storage_workflow(conn):
+    """Storage operations workflow. Returns 'exit' if user wants to exit program."""
+    while True:
+        srs = get_storage_repositories(conn.host)
+
+        if not srs:
+            print("\n  No storage repositories found in cache.")
+            print("  Try refreshing the cache from the main menu.")
+            input("\nPress Enter to continue...")
+            return
+
+        print(f"\n{'─' * 64}")
+        print(f"  Storage Repositories - {conn.host_name}")
+        print('─' * 64)
+
+        display_storage_list(srs)
+
+        print(f"\n  [#] View SR details    [c] Copy SR config")
+        print(f"  [q] Quit               [x] Exit")
+        print('─' * 64)
+        choice = input("Select: ").strip().lower()
+
+        if choice == 'x':
+            return 'exit'
+        elif choice == 'q':
+            return  # Back to main menu
+        elif choice == 'c':
+            # Copy SR config submenu
+            print("\nEnter SR number to copy config:")
+            sr_choice = input("SR #: ").strip()
+            try:
+                idx = int(sr_choice) - 1
+                if 0 <= idx < len(srs):
+                    show_sr_copy_options(srs[idx], conn)
+                else:
+                    print("Invalid selection.")
+            except ValueError:
+                print("Invalid selection.")
+        else:
+            # Try as SR number for details
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(srs):
+                    display_sr_details(srs[idx])
+                    input("\nPress Enter to continue...")
+                else:
+                    print("Invalid selection.")
+            except ValueError:
+                print(f"Invalid choice: '{choice}'")
+
+
+def show_sr_copy_options(sr, conn):
+    """Show options for copying SR configuration."""
+    # Only show copy options for types that make sense to copy
+    copyable_types = ['nfs', 'iso', 'smb', 'cifs', 'iscsi', 'lvmoiscsi', 'gfs2']
+
+    if sr['type'] not in copyable_types:
+        print(f"\n  SR type '{sr['type']}' is typically local storage and cannot be")
+        print("  meaningfully copied to another host.")
+        input("\nPress Enter to continue...")
+        return
+
+    device_config = json.loads(sr.get('device_config', '{}') or '{}')
+
+    print(f"\n{'=' * 64}")
+    print(f"  Copy SR: {sr['name_label']}")
+    print(f"{'=' * 64}")
+    print(f"  Type: {sr['type']}")
+
+    # Show key connection info
+    if sr['type'] in ('nfs', 'iso'):
+        server = device_config.get('server', device_config.get('location', 'Unknown'))
+        path = device_config.get('serverpath', device_config.get('path', ''))
+        print(f"  Server: {server}")
+        if path:
+            print(f"  Path: {path}")
+    elif sr['type'] in ('iscsi', 'lvmoiscsi'):
+        target = device_config.get('target', 'Unknown')
+        print(f"  Target: {target}")
+
+    print(f"\n  [1] Show xe command")
+    print(f"  [2] Show shell script for multiple hosts")
+    print(f"  [b] Back")
+
+    choice = input("\nSelect: ").strip().lower()
+
+    if choice == '1':
+        print(f"\n{'─' * 64}")
+        print("  XE Command (run on target host):")
+        print(f"{'─' * 64}")
+        print(f"\n{get_sr_create_command(sr)}\n")
+        input("Press Enter to continue...")
+
+    elif choice == '2':
+        # Get list of other servers from config
+        servers = load_server_config()
+        other_servers = [s['name'] for s in servers if s['address'] != conn.host]
+
+        print(f"\n{'─' * 64}")
+        print("  Shell Script:")
+        print(f"{'─' * 64}")
+        print(get_sr_create_script(sr, other_servers))
+        print()
+        input("Press Enter to continue...")
+
+
+# ============================================================================
 # VM CLONE
 # ============================================================================
 
@@ -1440,6 +1679,116 @@ def vm_delete(conn, vm_ref, vm_info, dry_run=False):
     return 'deleted'  # Special return to signal VM no longer exists
 
 
+def display_vm_overview(conn, vm_ref, vm_info):
+    """Display comprehensive VM information."""
+    api = conn.api
+
+    # Fetch full VM record
+    try:
+        rec = api.VM.get_record(vm_ref)
+    except Exception as e:
+        print(f"\nError fetching VM details: {e}")
+        return
+
+    print(f"\n{'=' * 64}")
+    print(f"  VM: {rec['name_label']}")
+    print(f"{'=' * 64}")
+
+    # Basic info
+    print(f"  UUID:        {rec['uuid']}")
+    print(f"  State:       {format_power_state(rec['power_state'])}")
+    if rec.get('name_description'):
+        desc = rec['name_description']
+        if len(desc) > 50:
+            desc = desc[:47] + '...'
+        print(f"  Description: {desc}")
+
+    # Compute resources
+    print(f"\n  vCPUs:       {rec['VCPUs_max']} max, {rec['VCPUs_at_startup']} at startup")
+    mem_max = format_size(rec['memory_static_max'])
+    mem_min = format_size(rec['memory_static_min'])
+    mem_dyn_max = format_size(rec['memory_dynamic_max'])
+    mem_dyn_min = format_size(rec['memory_dynamic_min'])
+    print(f"  Memory:      {mem_max} (static max)")
+    print(f"               {mem_dyn_min} - {mem_dyn_max} (dynamic range)")
+
+    # Boot info
+    boot_order = rec.get('HVM_boot_params', {}).get('order', 'cd')
+    print(f"  Boot order:  {boot_order}")
+
+    # Host residence
+    resident_ref = rec.get('resident_on', 'OpaqueRef:NULL')
+    if resident_ref != 'OpaqueRef:NULL':
+        try:
+            host_name = api.host.get_name_label(resident_ref)
+            print(f"  Running on:  {host_name}")
+        except:
+            pass
+
+    # Disks
+    disks = list_vm_disks(conn, vm_ref, vm_info)
+    if disks:
+        total_disk = sum(int(d['virtual_size']) for d in disks)
+        print(f"\n  Disks:       {len(disks)} ({format_size(total_disk)} total)")
+        for d in disks:
+            boot = ' [boot]' if d['bootable'] else ''
+            print(f"               {d['device']}: {d['name'][:30]} ({format_size(d['virtual_size'])}){boot}")
+
+    # Network interfaces
+    interfaces = list_vm_networks(conn, vm_ref, vm_info)
+    if interfaces:
+        print(f"\n  Networks:    {len(interfaces)} interface(s)")
+        for iface in interfaces:
+            print(f"               eth{iface['device']}: {iface['mac']} -> {iface['network_name']}")
+
+    # Snapshots
+    snapshots = rec.get('snapshots', [])
+    if snapshots:
+        print(f"\n  Snapshots:   {len(snapshots)}")
+        for snap_ref in snapshots[:5]:  # Show first 5
+            try:
+                snap_name = api.VM.get_name_label(snap_ref)
+                snap_time = api.VM.get_snapshot_time(snap_ref)
+                if hasattr(snap_time, 'value'):
+                    snap_time = str(snap_time.value)[:19]
+                print(f"               - {snap_name} ({snap_time})")
+            except:
+                pass
+        if len(snapshots) > 5:
+            print(f"               ... and {len(snapshots) - 5} more")
+
+    # Guest metrics (if running)
+    if rec['power_state'] == 'Running':
+        guest_metrics_ref = rec.get('guest_metrics', 'OpaqueRef:NULL')
+        if guest_metrics_ref != 'OpaqueRef:NULL':
+            try:
+                gm = api.VM_guest_metrics.get_record(guest_metrics_ref)
+                os_version = gm.get('os_version', {})
+                if os_version:
+                    os_name = os_version.get('name', os_version.get('distro', 'Unknown'))
+                    print(f"\n  Guest OS:    {os_name}")
+                networks = gm.get('networks', {})
+                if networks:
+                    print(f"  Guest IPs:")
+                    for key, ip in sorted(networks.items()):
+                        if '/ip' in key:
+                            print(f"               {key}: {ip}")
+            except:
+                pass
+
+    # Other info
+    start_time = rec.get('start_time')
+    if start_time and rec['power_state'] == 'Running':
+        if hasattr(start_time, 'value'):
+            start_time = str(start_time.value)[:19]
+        print(f"\n  Started:     {start_time}")
+
+    # Platform info
+    platform = rec.get('platform', {})
+    if platform.get('cores-per-socket'):
+        print(f"  Topology:    {platform.get('cores-per-socket')} cores/socket")
+
+
 # ============================================================================
 # MENUS AND WORKFLOWS
 # ============================================================================
@@ -1447,24 +1796,23 @@ def vm_delete(conn, vm_ref, vm_info, dry_run=False):
 def vm_operations_menu(vm_info):
     """Display VM operations menu."""
     options = [
-        ('1', 'Start'),
-        ('2', 'Shutdown (clean)'),
-        ('3', 'Shutdown (force)'),
-        ('4', 'Reboot'),
-        ('5', 'Create snapshot'),
-        ('6', 'Revert to snapshot'),
-        ('7', 'Delete snapshot'),
-        ('8', 'Resize disk'),
-        ('9', 'Add network interface'),
-        ('10', 'Remove network interface'),
-        ('11', 'Clone VM'),
-        ('12', 'View disks'),
-        ('13', 'View network interfaces'),
-        ('14', 'Delete VM'),
+        ('1', 'VM Overview'),
+        ('2', 'Start'),
+        ('3', 'Shutdown (clean)'),
+        ('4', 'Shutdown (force)'),
+        ('5', 'Reboot'),
+        ('6', 'Create snapshot'),
+        ('7', 'Revert to snapshot'),
+        ('8', 'Delete snapshot'),
+        ('9', 'Resize disk'),
+        ('10', 'Add network interface'),
+        ('11', 'Remove network interface'),
+        ('12', 'Clone VM'),
+        ('13', 'Delete VM'),
     ]
 
     title = f"VM: {vm_info['name']} ({format_power_state(vm_info['power_state'])})"
-    return display_menu(title, options)
+    return display_menu(title, options, show_quit=True, show_exit=True)
 
 
 def run_with_dry_run(operation_func, conn, vm_ref, vm_info, **kwargs):
@@ -1486,61 +1834,63 @@ def run_with_dry_run(operation_func, conn, vm_ref, vm_info, **kwargs):
 
 
 def vm_workflow(conn):
-    """Main VM operations workflow."""
+    """Main VM operations workflow. Returns 'exit' if user wants to exit program."""
     while True:
         vm_ref, vm_info = select_vm(conn)
-        
+
+        if vm_ref == 'exit':
+            return 'exit'
         if vm_ref is None:
-            return
-        
+            return  # Quit back to main menu
+
         while True:
             # Refresh VM info
-            vm_info = {
-                'ref': vm_ref,
-                'uuid': conn.api.VM.get_uuid(vm_ref),
-                'name': conn.api.VM.get_name_label(vm_ref),
-                'power_state': conn.api.VM.get_power_state(vm_ref),
-                'vcpus': conn.api.VM.get_VCPUs_max(vm_ref),
-                'memory': conn.api.VM.get_memory_static_max(vm_ref)
-            }
-            
-            choice = vm_operations_menu(vm_info)
-            
-            if choice == 'q':
-                return
-            elif choice == 'b':
+            try:
+                vm_info = {
+                    'ref': vm_ref,
+                    'uuid': conn.api.VM.get_uuid(vm_ref),
+                    'name': conn.api.VM.get_name_label(vm_ref),
+                    'power_state': conn.api.VM.get_power_state(vm_ref),
+                    'vcpus': conn.api.VM.get_VCPUs_max(vm_ref),
+                    'memory': conn.api.VM.get_memory_static_max(vm_ref)
+                }
+            except Exception:
+                # VM may have been deleted
+                print("\nVM no longer exists.")
                 break
+
+            choice = vm_operations_menu(vm_info)
+
+            if choice == 'x':
+                return 'exit'
+            elif choice == 'q':
+                break  # Back to VM selection
             elif choice == '1':
-                vm_start(conn, vm_ref, vm_info)
+                display_vm_overview(conn, vm_ref, vm_info)
+                input("\nPress Enter to continue...")
             elif choice == '2':
-                run_with_dry_run(vm_shutdown, conn, vm_ref, vm_info, force=False)
+                vm_start(conn, vm_ref, vm_info)
             elif choice == '3':
-                run_with_dry_run(vm_shutdown, conn, vm_ref, vm_info, force=True)
+                run_with_dry_run(vm_shutdown, conn, vm_ref, vm_info, force=False)
             elif choice == '4':
-                run_with_dry_run(vm_reboot, conn, vm_ref, vm_info)
+                run_with_dry_run(vm_shutdown, conn, vm_ref, vm_info, force=True)
             elif choice == '5':
-                run_with_dry_run(vm_snapshot, conn, vm_ref, vm_info)
+                run_with_dry_run(vm_reboot, conn, vm_ref, vm_info)
             elif choice == '6':
-                run_with_dry_run(vm_revert_snapshot, conn, vm_ref, vm_info)
+                run_with_dry_run(vm_snapshot, conn, vm_ref, vm_info)
             elif choice == '7':
-                run_with_dry_run(vm_delete_snapshot, conn, vm_ref, vm_info)
+                run_with_dry_run(vm_revert_snapshot, conn, vm_ref, vm_info)
             elif choice == '8':
-                run_with_dry_run(resize_vdi, conn, vm_ref, vm_info)
+                run_with_dry_run(vm_delete_snapshot, conn, vm_ref, vm_info)
             elif choice == '9':
-                run_with_dry_run(add_vif, conn, vm_ref, vm_info)
+                run_with_dry_run(resize_vdi, conn, vm_ref, vm_info)
             elif choice == '10':
-                run_with_dry_run(remove_vif, conn, vm_ref, vm_info)
+                run_with_dry_run(add_vif, conn, vm_ref, vm_info)
             elif choice == '11':
-                run_with_dry_run(vm_clone, conn, vm_ref, vm_info)
+                run_with_dry_run(remove_vif, conn, vm_ref, vm_info)
             elif choice == '12':
-                disks = list_vm_disks(conn, vm_ref, vm_info)
-                display_vm_disks(disks)
-                input("\nPress Enter to continue...")
+                run_with_dry_run(vm_clone, conn, vm_ref, vm_info)
             elif choice == '13':
-                interfaces = list_vm_networks(conn, vm_ref, vm_info)
-                display_vm_networks(interfaces)
-                input("\nPress Enter to continue...")
-            elif choice == '14':
                 result = run_with_dry_run(vm_delete, conn, vm_ref, vm_info)
                 if result == 'deleted':
                     # VM no longer exists, go back to VM selection
@@ -1557,9 +1907,8 @@ def main_menu(host_name=None):
         ('2', 'Host Overview'),
         ('3', 'Storage Overview'),
         ('r', 'Refresh cache'),
-        ('s', 'Switch server'),
     ]
-    return display_menu(title, options, show_back=False)
+    return display_menu(title, options, show_quit=True, show_exit=True)
 
 
 # ============================================================================
@@ -1762,22 +2111,25 @@ def _connect_and_sync(host, user, password, host_name):
 
 
 def _run_main_menu(conn):
-    """Run the main menu loop. Returns True if user wants to switch servers, False to quit."""
+    """Run the main menu loop. Returns True if user wants to switch servers, False to exit."""
     while True:
         choice = main_menu(host_name=conn.host_name)
 
-        if choice == 'q':
-            return False  # Quit program
-        elif choice == 's':
-            return True   # Switch server
+        if choice == 'x':
+            return False  # Exit program
+        elif choice == 'q':
+            return True   # Quit to server selection
         elif choice == '1':
-            vm_workflow(conn)
+            result = vm_workflow(conn)
+            if result == 'exit':
+                return False
         elif choice == '2':
             display_host_overview(conn)
             input("Press Enter to continue...")
         elif choice == '3':
-            print("\n[Storage overview not yet implemented]")
-            input("Press Enter...")
+            result = storage_workflow(conn)
+            if result == 'exit':
+                return False
         elif choice == 'r':
             print("\nRefreshing cache from host...")
             try:
