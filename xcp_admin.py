@@ -17,11 +17,14 @@ Features operation logging for audit trail and debugging.
 import sys
 import ssl
 import json
+import socket
 import logging
 import argparse
 from pathlib import Path
+import subprocess
 from datetime import datetime
 from getpass import getpass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import XenAPI
@@ -254,6 +257,15 @@ CREATE TABLE IF NOT EXISTS srs (
     other_config TEXT,
     FOREIGN KEY (host_address) REFERENCES sync_info(host_address)
 );
+
+CREATE TABLE IF NOT EXISTS pbds (
+    uuid TEXT PRIMARY KEY,
+    host_address TEXT,
+    sr_uuid TEXT,
+    device_config TEXT,
+    currently_attached INTEGER,
+    FOREIGN KEY (host_address) REFERENCES sync_info(host_address)
+);
 """
 
 
@@ -287,7 +299,7 @@ def get_db(db_path=DB_FILE):
 
 def clear_host_data(db, host_address):
     """Delete all cached data for a host."""
-    tables = ['hosts', 'vms', 'vdis', 'vbds', 'networks', 'vifs', 'srs']
+    tables = ['hosts', 'vms', 'vdis', 'vbds', 'networks', 'vifs', 'srs', 'pbds']
     for table in tables:
         db.execute(f"DELETE FROM {table} WHERE host_address = ?", (host_address,))
     db.commit()
@@ -389,6 +401,23 @@ def sync_host_to_cache(api_conn, host_address, host_name):
                   json.dumps(rec.get('sm_config', {})),
                   json.dumps(rec.get('other_config', {}))))
         print(f"{len(sr_records)} found")
+
+        # Sync PBDs (Physical Block Devices - contain mount info for SRs)
+        print("    - Physical block devices...", end=" ", flush=True)
+        pbd_records = api.PBD.get_all_records()
+        for ref, rec in pbd_records.items():
+            sr_uuid = None
+            sr_ref = rec.get('SR', 'OpaqueRef:NULL')
+            if sr_ref != 'OpaqueRef:NULL' and sr_ref in sr_records:
+                sr_uuid = sr_records[sr_ref]['uuid']
+            db.execute("""
+                INSERT OR REPLACE INTO pbds (uuid, host_address, sr_uuid,
+                    device_config, currently_attached)
+                VALUES (?, ?, ?, ?, ?)
+            """, (rec['uuid'], host_address, sr_uuid,
+                  json.dumps(rec.get('device_config', {})),
+                  1 if rec.get('currently_attached', False) else 0))
+        print(f"{len(pbd_records)} found")
 
         # Sync VDIs
         print("    - Virtual disks...", end=" ", flush=True)
@@ -519,6 +548,33 @@ class XCPConnection:
                 pass
 
 
+def check_host_reachable(address, port=443, timeout=2):
+    """Check if a host is reachable on given port."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((address, port))
+        sock.close()
+        return result == 0
+    except:
+        return False
+
+
+def check_servers_status(servers, timeout=2):
+    """Check reachability of all servers in parallel. Returns dict of address -> bool."""
+    status = {}
+    with ThreadPoolExecutor(max_workers=len(servers)) as executor:
+        futures = {executor.submit(check_host_reachable, s['address'], 443, timeout): s['address']
+                   for s in servers}
+        for future in as_completed(futures):
+            address = futures[future]
+            try:
+                status[address] = future.result()
+            except:
+                status[address] = False
+    return status
+
+
 def select_server(servers):
     """Interactive server selection from config.
 
@@ -530,11 +586,19 @@ def select_server(servers):
     print(f"\n{'─' * 60}")
     print("  Select Server")
     print('─' * 60)
-    print(f"  {'#':<4} {'Name':<15} {'Address'}")
-    print('  ' + '-' * 40)
+
+    # Check server availability in parallel
+    print("  Checking server status...", end='', flush=True)
+    status = check_servers_status(servers)
+    print("\r" + " " * 35 + "\r", end='')  # Clear the checking message
+
+    print(f"  {'#':<4} {'Name':<15} {'Address':<18} {'Status'}")
+    print('  ' + '-' * 50)
 
     for i, s in enumerate(servers, 1):
-        print(f"  {i:<4} {s['name']:<15} {s['address']}")
+        online = status.get(s['address'], False)
+        status_str = "online" if online else "OFFLINE"
+        print(f"  {i:<4} {s['name']:<15} {s['address']:<18} {status_str}")
 
     print(f"  [x] Exit")
     print('─' * 60)
@@ -1372,6 +1436,19 @@ def display_storage_list(srs):
         print(f"  {i:<3} {name:<25} {sr['type']:<10} {used:<10} {total:<10} {shared}")
 
 
+def get_sr_pbd_config(sr_uuid, host_address):
+    """Get PBD device_config for an SR (contains NFS mount info, etc.)."""
+    db = get_db()
+    pbd = db.execute("""
+        SELECT device_config, currently_attached FROM pbds
+        WHERE sr_uuid = ? AND host_address = ?
+    """, (sr_uuid, host_address)).fetchone()
+    db.close()
+    if pbd:
+        return json.loads(pbd['device_config'] or '{}'), pbd['currently_attached']
+    return {}, False
+
+
 def display_sr_details(sr):
     """Display detailed SR information."""
     print(f"\n{'=' * 64}")
@@ -1389,10 +1466,17 @@ def display_sr_details(sr):
     print(f"  Used:        {used}")
     print(f"  Total:       {total}")
 
-    # Device config (contains NFS server/path, etc.)
+    # Get PBD device_config (contains actual mount info for NFS, iSCSI, etc.)
+    pbd_config, attached = get_sr_pbd_config(sr['uuid'], sr['host_address'])
+    if pbd_config:
+        print(f"\n  Connection ({('attached' if attached else 'detached')}):")
+        for key, val in pbd_config.items():
+            print(f"    {key}: {val}")
+
+    # SR device config (usually empty for NFS/ISO, info is in PBD)
     device_config = json.loads(sr.get('device_config', '{}') or '{}')
     if device_config:
-        print(f"\n  Device Config:")
+        print(f"\n  SR Device Config:")
         for key, val in device_config.items():
             print(f"    {key}: {val}")
 
@@ -1404,9 +1488,288 @@ def display_sr_details(sr):
             print(f"    {key}: {val}")
 
 
+def sr_details_workflow(sr, conn):
+    """SR details view with edit option."""
+    # Types that support connection editing
+    editable_types = ['nfs', 'iso', 'smb', 'cifs', 'iscsi', 'lvmoiscsi']
+
+    while True:
+        display_sr_details(sr)
+
+        # Show options
+        pbd_config, attached = get_sr_pbd_config(sr['uuid'], sr['host_address'])
+        if sr['type'] in editable_types and pbd_config:
+            print(f"\n  [e] Edit connection    [q] Back")
+        else:
+            print(f"\n  [q] Back")
+
+        choice = input("\nSelect: ").strip().lower()
+
+        if choice == 'q' or choice == '':
+            return
+        elif choice == 'e' and sr['type'] in editable_types and pbd_config:
+            edit_sr_connection(sr, conn)
+            # Refresh SR data after edit
+            return
+
+
+def edit_sr_connection(sr, conn):
+    """Show commands to edit an SR's connection parameters (NFS path, etc.)."""
+    pbd_config, attached = get_sr_pbd_config(sr['uuid'], sr['host_address'])
+
+    if not pbd_config:
+        print("\n  No connection parameters found for this SR.")
+        input("\nPress Enter to continue...")
+        return
+
+    # Allow editing the config
+    edited_config = dict(pbd_config)
+
+    while True:
+        print(f"\n{'=' * 64}")
+        print(f"  Edit SR Connection: {sr['name_label']}")
+        print(f"{'=' * 64}")
+        print(f"  Status: {'Attached' if attached else 'Detached'}")
+
+        print(f"\n  Connection parameters:")
+        keys = list(edited_config.keys())
+        for i, key in enumerate(keys, 1):
+            orig = pbd_config.get(key, '')
+            curr = edited_config[key]
+            if orig != curr:
+                print(f"    [{i}] {key}: {curr}  (was: {orig})")
+            else:
+                print(f"    [{i}] {key}: {curr}")
+
+        has_changes = edited_config != pbd_config
+        print()
+        if has_changes:
+            print(f"  [c] Apply changes")
+        print(f"  [q] Back")
+
+        choice = input("\nSelect: ").strip().lower()
+
+        if choice == 'q':
+            return
+
+        # Check if editing a parameter
+        try:
+            param_idx = int(choice) - 1
+            if 0 <= param_idx < len(keys):
+                key = keys[param_idx]
+                print(f"\n  Current {key}: {edited_config[key]}")
+                new_val = input(f"  New {key} (Enter to keep): ").strip()
+                if new_val:
+                    edited_config[key] = new_val
+                continue
+        except ValueError:
+            pass
+
+        if choice == 'c':
+            result = _show_pbd_update_commands(sr, pbd_config, edited_config, attached, conn)
+            if result == 'applied':
+                return  # Go back after successful apply
+
+
+def _show_pbd_update_commands(sr, old_config, new_config, attached, conn):
+    """Show xe commands to update PBD configuration. Returns 'applied' if executed."""
+    # Check if anything changed
+    if old_config == new_config:
+        print("\n  No changes made.")
+        input("\nPress Enter to continue...")
+        return None
+
+    dc_params = ' '.join(f"device-config:{k}=\"{v}\"" for k, v in new_config.items())
+
+    while True:
+        print(f"\n{'─' * 64}")
+        print("  XE Commands to Update SR Connection")
+        print(f"{'─' * 64}")
+        print(f"  # SR: {sr['name_label']}")
+        print(f"  # Changes:")
+        for key in new_config:
+            if old_config.get(key) != new_config[key]:
+                print(f"  #   {key}: {old_config.get(key, '')} -> {new_config[key]}")
+
+        print()
+
+        # Method: Destroy and recreate PBD
+        print("  # Step 1: Get the PBD UUID for this SR")
+        print(f"  PBD=$(xe pbd-list sr-uuid={sr['uuid']} --minimal)")
+        print()
+
+        if attached:
+            print("  # Step 2: Detach the PBD")
+            print("  xe pbd-unplug uuid=$PBD")
+            print()
+
+        print("  # Step 3: Destroy the old PBD")
+        print("  xe pbd-destroy uuid=$PBD")
+        print()
+
+        print("  # Step 4: Get host UUID and create new PBD")
+        print("  HOST=$(xe host-list --minimal)")
+        print(f"  xe pbd-create sr-uuid={sr['uuid']} host-uuid=$HOST {dc_params}")
+        print()
+
+        print("  # Step 5: Plug the new PBD")
+        print(f"  NEW_PBD=$(xe pbd-list sr-uuid={sr['uuid']} --minimal)")
+        print("  xe pbd-plug uuid=$NEW_PBD")
+
+        print(f"\n{'─' * 64}")
+        print("  [r] Run via SSH    [q] Back")
+
+        choice = input("\nSelect: ").strip().lower()
+
+        if choice == 'q' or choice == '':
+            return None
+        elif choice == 'r':
+            confirm = input("\n  Apply changes via SSH? Type 'yes' to confirm: ").strip()
+            if confirm.lower() == 'yes':
+                success = _apply_pbd_update_ssh(sr, new_config, attached, conn)
+                if success:
+                    return 'applied'
+            else:
+                print("  Cancelled.")
+
+
+def _apply_pbd_update_ssh(sr, new_config, attached, conn):
+    """Apply PBD update via SSH. Returns True on success."""
+    # Get server password from config
+    servers = load_server_config()
+    server = next((s for s in servers if s['address'] == conn.host), None)
+
+    if not server:
+        print(f"\n  Error: Could not find credentials for {conn.host}")
+        input("\nPress Enter to continue...")
+        return False
+
+    host = conn.host
+    password = server['password']
+    dc_params = ' '.join(f"device-config:{k}='{v}'" for k, v in new_config.items())
+
+    # Build the command script - more robust version
+    script = f'''
+set -e
+PBD=$(xe pbd-list sr-uuid={sr['uuid']} --minimal)
+if [ -z "$PBD" ]; then
+    echo "Error: No PBD found for this SR"
+    exit 1
+fi
+echo "PBD UUID: $PBD"
+
+# Check if currently attached
+ATTACHED=$(xe pbd-param-get uuid=$PBD param-name=currently-attached 2>/dev/null || echo "false")
+if [ "$ATTACHED" = "true" ]; then
+    echo "Detaching PBD..."
+    if ! xe pbd-unplug uuid=$PBD 2>&1; then
+        echo ""
+        echo "Failed to detach. The NFS mount may be busy."
+        echo "Try: ssh root@$(hostname) 'fuser -m /run/sr-mount/{sr['uuid']}'"
+        echo "Or wait a moment and retry."
+        exit 1
+    fi
+else
+    echo "PBD already detached"
+fi
+
+echo "Destroying old PBD..."
+xe pbd-destroy uuid=$PBD
+HOST=$(xe host-list --minimal)
+echo "Creating new PBD on host $HOST..."
+xe pbd-create sr-uuid={sr['uuid']} host-uuid=$HOST {dc_params}
+NEW_PBD=$(xe pbd-list sr-uuid={sr['uuid']} --minimal)
+echo "Plugging new PBD: $NEW_PBD"
+xe pbd-plug uuid=$NEW_PBD
+echo "Done!"
+'''
+
+    print(f"\n  Connecting to {conn.host_name}...")
+
+    try:
+        # Use sshpass if available, otherwise try ssh with key auth
+        result = subprocess.run(
+            ['sshpass', '-p', password, 'ssh', '-o', 'StrictHostKeyChecking=no',
+             f'root@{host}', 'bash -s'],
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        if result.returncode == 0:
+            print(f"\n  {result.stdout.strip()}")
+            print("\n  ✓ SR connection updated successfully!")
+            print("  Refreshing cache...")
+            conn.sync_to_cache()
+            input("\nPress Enter to continue...")
+            return True
+        else:
+            # Show both stdout and stderr - script errors often go to stdout
+            output = result.stdout.strip()
+            error_msg = result.stderr.strip()
+            if output:
+                print(f"\n  Output:\n  {output.replace(chr(10), chr(10) + '  ')}")
+            if error_msg:
+                print(f"\n  Error: {error_msg}")
+            combined = output + error_msg
+            if 'VDI is in use' in combined or 'in use by some other operation' in combined:
+                print("\n  Tip: Use [4] Host Operations > Eject all ISOs to unmount ISOs first.")
+            input("\nPress Enter to continue...")
+            return False
+
+    except FileNotFoundError:
+        # sshpass not installed, try without password (key auth)
+        try:
+            result = subprocess.run(
+                ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes',
+                 f'root@{host}', 'bash -s'],
+                input=script,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+
+            if result.returncode == 0:
+                print(f"\n  {result.stdout.strip()}")
+                print("\n  ✓ SR connection updated successfully!")
+                print("  Refreshing cache...")
+                conn.sync_to_cache()
+                input("\nPress Enter to continue...")
+                return True
+            else:
+                error_msg = result.stderr.strip()
+                print(f"\n  Error: {error_msg}")
+                if 'VDI is in use' in error_msg or 'in use by some other operation' in error_msg:
+                    print("\n  Tip: Use [4] Host Operations > Eject all ISOs to unmount ISOs first.")
+                print("\n  Note: Install 'sshpass' for password auth: sudo apt install sshpass")
+                input("\nPress Enter to continue...")
+                return False
+
+        except Exception as e:
+            print(f"\n  SSH Error: {e}")
+            print("  Note: Install 'sshpass' for password auth: sudo apt install sshpass")
+            input("\nPress Enter to continue...")
+            return False
+
+    except subprocess.TimeoutExpired:
+        print("\n  Error: SSH command timed out")
+        input("\nPress Enter to continue...")
+        return False
+
+    except Exception as e:
+        print(f"\n  Error: {e}")
+        input("\nPress Enter to continue...")
+        return False
+
+
 def get_sr_create_command(sr):
     """Generate xe command to recreate this SR on another host."""
-    device_config = json.loads(sr.get('device_config', '{}') or '{}')
+    # Get device_config from PBD (has actual mount info) and merge with SR config
+    pbd_config, _ = get_sr_pbd_config(sr['uuid'], sr['host_address'])
+    sr_config = json.loads(sr.get('device_config', '{}') or '{}')
+    device_config = {**sr_config, **pbd_config}  # PBD takes precedence
+
     sm_config = json.loads(sr.get('sm_config', '{}') or '{}')
 
     sr_type = sr['type']
@@ -1414,8 +1777,8 @@ def get_sr_create_command(sr):
     desc = sr['name_description'] or ''
 
     # Build device-config params
-    dc_params = ' '.join(f"device-config:{k}={v}" for k, v in device_config.items())
-    sm_params = ' '.join(f"sm-config:{k}={v}" for k, v in sm_config.items())
+    dc_params = ' '.join(f"device-config:{k}=\"{v}\"" for k, v in device_config.items())
+    sm_params = ' '.join(f"sm-config:{k}=\"{v}\"" for k, v in sm_config.items())
 
     # Base command
     cmd = f"xe sr-create name-label=\"{name}\""
@@ -1434,7 +1797,10 @@ def get_sr_create_command(sr):
 
 def get_sr_create_script(sr, target_servers=None):
     """Generate a shell script to create this SR on multiple servers."""
-    device_config = json.loads(sr.get('device_config', '{}') or '{}')
+    # Get device_config from PBD (has actual mount info) and merge with SR config
+    pbd_config, _ = get_sr_pbd_config(sr['uuid'], sr['host_address'])
+    sr_config = json.loads(sr.get('device_config', '{}') or '{}')
+    device_config = {**sr_config, **pbd_config}  # PBD takes precedence
 
     lines = ["#!/bin/bash", "# Auto-generated script to create SR on XCP-ng hosts", ""]
     lines.append(f"SR_NAME=\"{sr['name_label']}\"")
@@ -1509,24 +1875,34 @@ def storage_workflow(conn):
         elif choice == 'q':
             return  # Back to main menu
         elif choice == 'c':
-            # Copy SR config submenu
-            print("\nEnter SR number to copy config:")
-            sr_choice = input("SR #: ").strip()
+            # Copy SR config - only show remote/shared storage types
+            copyable_types = ['nfs', 'iso', 'smb', 'cifs', 'iscsi', 'lvmoiscsi', 'gfs2']
+            copyable_srs = [sr for sr in srs if sr['type'] in copyable_types]
+
+            if not copyable_srs:
+                print("\n  No remote storage repositories to copy.")
+                input("\nPress Enter to continue...")
+                continue
+
+            print(f"\n  Remote Storage Repositories:")
+            for i, sr in enumerate(copyable_srs, 1):
+                print(f"    [{i}] {sr['name_label']} ({sr['type']})")
+
+            sr_choice = input("\n  Select SR to copy: ").strip()
             try:
                 idx = int(sr_choice) - 1
-                if 0 <= idx < len(srs):
-                    show_sr_copy_options(srs[idx], conn)
+                if 0 <= idx < len(copyable_srs):
+                    show_sr_copy_options(copyable_srs[idx], conn)
                 else:
-                    print("Invalid selection.")
+                    print("  Invalid selection.")
             except ValueError:
-                print("Invalid selection.")
+                print("  Invalid selection.")
         else:
             # Try as SR number for details
             try:
                 idx = int(choice) - 1
                 if 0 <= idx < len(srs):
-                    display_sr_details(srs[idx])
-                    input("\nPress Enter to continue...")
+                    sr_details_workflow(srs[idx], conn)
                 else:
                     print("Invalid selection.")
             except ValueError:
@@ -1544,48 +1920,145 @@ def show_sr_copy_options(sr, conn):
         input("\nPress Enter to continue...")
         return
 
-    device_config = json.loads(sr.get('device_config', '{}') or '{}')
+    # Get device_config from PBD (actual connection info) merged with SR config
+    pbd_config, _ = get_sr_pbd_config(sr['uuid'], sr['host_address'])
+    sr_config = json.loads(sr.get('device_config', '{}') or '{}')
+    device_config = {**sr_config, **pbd_config}
 
-    print(f"\n{'=' * 64}")
-    print(f"  Copy SR: {sr['name_label']}")
-    print(f"{'=' * 64}")
-    print(f"  Type: {sr['type']}")
+    # Allow editing the config
+    edited_config = dict(device_config)
 
-    # Show key connection info
-    if sr['type'] in ('nfs', 'iso'):
-        server = device_config.get('server', device_config.get('location', 'Unknown'))
-        path = device_config.get('serverpath', device_config.get('path', ''))
-        print(f"  Server: {server}")
-        if path:
-            print(f"  Path: {path}")
-    elif sr['type'] in ('iscsi', 'lvmoiscsi'):
-        target = device_config.get('target', 'Unknown')
-        print(f"  Target: {target}")
+    while True:
+        print(f"\n{'=' * 64}")
+        print(f"  Copy SR: {sr['name_label']}")
+        print(f"{'=' * 64}")
+        print(f"  Type: {sr['type']}")
 
-    print(f"\n  [1] Show xe command")
-    print(f"  [2] Show shell script for multiple hosts")
-    print(f"  [b] Back")
+        # Show current connection config
+        if edited_config:
+            print(f"\n  Connection parameters:")
+            for i, (key, val) in enumerate(edited_config.items(), 1):
+                print(f"    [{i}] {key}: {val}")
+        else:
+            print(f"\n  No connection parameters found.")
 
-    choice = input("\nSelect: ").strip().lower()
+        print(f"\n  [1-{len(edited_config)}] Edit parameter")
+        print(f"  [c] Show xe command")
+        print(f"  [s] Show shell script for multiple hosts")
+        print(f"  [q] Back")
 
-    if choice == '1':
-        print(f"\n{'─' * 64}")
-        print("  XE Command (run on target host):")
-        print(f"{'─' * 64}")
-        print(f"\n{get_sr_create_command(sr)}\n")
-        input("Press Enter to continue...")
+        choice = input("\nSelect: ").strip().lower()
 
-    elif choice == '2':
-        # Get list of other servers from config
-        servers = load_server_config()
-        other_servers = [s['name'] for s in servers if s['address'] != conn.host]
+        if choice == 'q':
+            return
 
-        print(f"\n{'─' * 64}")
-        print("  Shell Script:")
-        print(f"{'─' * 64}")
-        print(get_sr_create_script(sr, other_servers))
-        print()
-        input("Press Enter to continue...")
+        # Check if editing a parameter
+        try:
+            param_idx = int(choice) - 1
+            if 0 <= param_idx < len(edited_config):
+                keys = list(edited_config.keys())
+                key = keys[param_idx]
+                print(f"\n  Current {key}: {edited_config[key]}")
+                new_val = input(f"  New {key} (Enter to keep): ").strip()
+                if new_val:
+                    edited_config[key] = new_val
+                continue
+        except ValueError:
+            pass
+
+        if choice == 'c':
+            print(f"\n{'─' * 64}")
+            print("  XE Command (run on target host):")
+            print(f"{'─' * 64}")
+            print(f"\n{_get_sr_create_command_with_config(sr, edited_config)}\n")
+            input("Press Enter to continue...")
+
+        elif choice == 's':
+            # Get list of other servers from config
+            servers = load_server_config()
+            other_servers = [s['name'] for s in servers if s['address'] != conn.host]
+
+            print(f"\n{'─' * 64}")
+            print("  Shell Script:")
+            print(f"{'─' * 64}")
+            print(_get_sr_create_script_with_config(sr, edited_config, other_servers))
+            print()
+            input("Press Enter to continue...")
+
+
+def _get_sr_create_command_with_config(sr, device_config):
+    """Generate xe command with provided device_config."""
+    sm_config = json.loads(sr.get('sm_config', '{}') or '{}')
+
+    sr_type = sr['type']
+    name = sr['name_label']
+    desc = sr['name_description'] or ''
+
+    # Build device-config params
+    dc_params = ' '.join(f"device-config:{k}=\"{v}\"" for k, v in device_config.items())
+    sm_params = ' '.join(f"sm-config:{k}=\"{v}\"" for k, v in sm_config.items())
+
+    # Base command
+    cmd = f"xe sr-create name-label=\"{name}\""
+    if desc:
+        cmd += f" name-description=\"{desc}\""
+    cmd += f" type={sr_type} shared={'true' if sr['shared'] else 'false'}"
+    if sr['content_type']:
+        cmd += f" content-type={sr['content_type']}"
+    if dc_params:
+        cmd += f" {dc_params}"
+    if sm_params:
+        cmd += f" {sm_params}"
+
+    return cmd
+
+
+def _get_sr_create_script_with_config(sr, device_config, target_servers=None):
+    """Generate a shell script with provided device_config."""
+    lines = ["#!/bin/bash", "# Auto-generated script to create SR on XCP-ng hosts", ""]
+    lines.append(f"SR_NAME=\"{sr['name_label']}\"")
+    lines.append(f"SR_DESC=\"{sr['name_description'] or ''}\"")
+    lines.append(f"SR_TYPE=\"{sr['type']}\"")
+    lines.append(f"SR_SHARED=\"{'true' if sr['shared'] else 'false'}\"")
+
+    if sr['content_type']:
+        lines.append(f"SR_CONTENT=\"{sr['content_type']}\"")
+
+    # Add device config as variables
+    for key, val in device_config.items():
+        var_name = f"DC_{key.upper().replace('-', '_').replace(':', '_')}"
+        lines.append(f"{var_name}=\"{val}\"")
+
+    lines.append("")
+    lines.append("# Target hosts (edit as needed)")
+
+    if target_servers:
+        lines.append(f"HOSTS=({' '.join(target_servers)})")
+    else:
+        lines.append("HOSTS=(xcpng01 xcpng02 xcpng03)")
+
+    lines.append("")
+    lines.append("for HOST in \"${HOSTS[@]}\"; do")
+    lines.append("    echo \"Creating SR on $HOST...\"")
+
+    # Build xe command
+    cmd_parts = ["    ssh root@$HOST xe sr-create"]
+    cmd_parts.append("        name-label=\"$SR_NAME\"")
+    cmd_parts.append("        name-description=\"$SR_DESC\"")
+    cmd_parts.append("        type=$SR_TYPE")
+    cmd_parts.append("        shared=$SR_SHARED")
+
+    if sr['content_type']:
+        cmd_parts.append("        content-type=$SR_CONTENT")
+
+    for key in device_config.keys():
+        var_name = f"DC_{key.upper().replace('-', '_').replace(':', '_')}"
+        cmd_parts.append(f"        device-config:{key}=\"${var_name}\"")
+
+    lines.append(" \\\n".join(cmd_parts))
+    lines.append("done")
+
+    return "\n".join(lines)
 
 
 # ============================================================================
@@ -1899,6 +2372,217 @@ def vm_workflow(conn):
                 print(f"\nInvalid choice: '{choice}'")
 
 
+# ============================================================================
+# HOST OPERATIONS
+# ============================================================================
+
+def host_operations_workflow(conn):
+    """Host-level operations workflow. Returns 'exit' if user wants to exit program."""
+    while True:
+        print(f"\n{'─' * 64}")
+        print(f"  Host Operations - {conn.host_name}")
+        print('─' * 64)
+
+        options = [
+            ('1', 'Eject all ISOs from VMs'),
+            ('2', 'Reboot hypervisor'),
+        ]
+
+        for key, label in options:
+            print(f"  [{key}] {label}")
+
+        print(f"\n  [q] Quit               [x] Exit")
+        print('─' * 64)
+        choice = input("Select: ").strip().lower()
+
+        if choice == 'x':
+            return 'exit'
+        elif choice == 'q':
+            return  # Back to main menu
+        elif choice == '1':
+            eject_all_isos(conn)
+        elif choice == '2':
+            reboot_hypervisor(conn)
+        else:
+            print(f"Invalid choice: '{choice}'")
+
+
+def eject_all_isos(conn):
+    """Eject all mounted ISOs from VMs on this host."""
+    # Get server password
+    servers = load_server_config()
+    server = next((s for s in servers if s['address'] == conn.host), None)
+
+    if not server:
+        print(f"\n  Error: Could not find credentials for {conn.host}")
+        input("\nPress Enter to continue...")
+        return
+
+    print(f"\n  Scanning for mounted ISOs...")
+
+    # First, find all mounted ISOs via SSH
+    scan_script = '''
+xe vbd-list type=CD empty=false --minimal 2>/dev/null | tr ',' '\n' | while read vbd; do
+    if [ -n "$vbd" ]; then
+        vm_uuid=$(xe vbd-param-get uuid=$vbd param-name=vm-uuid 2>/dev/null)
+        vm_name=$(xe vm-param-get uuid=$vm_uuid param-name=name-label 2>/dev/null)
+        vdi_uuid=$(xe vbd-param-get uuid=$vbd param-name=vdi-uuid 2>/dev/null)
+        vdi_name=$(xe vdi-param-get uuid=$vdi_uuid param-name=name-label 2>/dev/null)
+        echo "$vbd|$vm_name|$vdi_name"
+    fi
+done
+'''
+
+    try:
+        result = subprocess.run(
+            ['sshpass', '-p', server['password'], 'ssh', '-o', 'StrictHostKeyChecking=no',
+             f'root@{conn.host}', 'bash -s'],
+            input=scan_script,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            print(f"\n  Error scanning: {result.stderr.strip()}")
+            input("\nPress Enter to continue...")
+            return
+
+        mounted = []
+        for line in result.stdout.strip().split('\n'):
+            if '|' in line:
+                parts = line.split('|')
+                if len(parts) >= 3:
+                    mounted.append({
+                        'vbd': parts[0],
+                        'vm': parts[1],
+                        'iso': parts[2]
+                    })
+
+        if not mounted:
+            print("\n  No ISOs currently mounted.")
+            input("\nPress Enter to continue...")
+            return
+
+        print(f"\n  Found {len(mounted)} mounted ISO(s):")
+        for m in mounted:
+            print(f"    - {m['vm']}: {m['iso']}")
+
+        confirm = input(f"\n  Eject all {len(mounted)} ISOs? Type 'yes' to confirm: ").strip()
+        if confirm.lower() != 'yes':
+            print("  Cancelled.")
+            input("\nPress Enter to continue...")
+            return
+
+        # Eject all
+        vbd_list = ' '.join(m['vbd'] for m in mounted)
+        eject_script = f'''
+for vbd in {vbd_list}; do
+    echo "Ejecting $vbd..."
+    xe vbd-eject uuid=$vbd 2>&1 || echo "  Failed to eject $vbd"
+done
+echo "Done!"
+'''
+
+        print(f"\n  Ejecting ISOs...")
+        result = subprocess.run(
+            ['sshpass', '-p', server['password'], 'ssh', '-o', 'StrictHostKeyChecking=no',
+             f'root@{conn.host}', 'bash -s'],
+            input=eject_script,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        print(f"\n  {result.stdout.strip()}")
+        if result.stderr.strip():
+            print(f"  {result.stderr.strip()}")
+
+        print("\n  ✓ ISO eject complete")
+        input("\nPress Enter to continue...")
+
+    except FileNotFoundError:
+        print("\n  Error: sshpass not installed. Run: sudo apt install sshpass")
+        input("\nPress Enter to continue...")
+    except subprocess.TimeoutExpired:
+        print("\n  Error: SSH command timed out")
+        input("\nPress Enter to continue...")
+    except Exception as e:
+        print(f"\n  Error: {e}")
+        input("\nPress Enter to continue...")
+
+
+def reboot_hypervisor(conn):
+    """Reboot the hypervisor - only if all VMs are halted."""
+    # Get server password
+    servers = load_server_config()
+    server = next((s for s in servers if s['address'] == conn.host), None)
+
+    if not server:
+        print(f"\n  Error: Could not find credentials for {conn.host}")
+        input("\nPress Enter to continue...")
+        return
+
+    # Check for running VMs from cache
+    db = get_db()
+    running_vms = db.execute("""
+        SELECT name_label, power_state FROM vms
+        WHERE host_address = ?
+          AND is_template = 0
+          AND is_control_domain = 0
+          AND is_snapshot = 0
+          AND power_state != 'Halted'
+        ORDER BY name_label
+    """, (conn.host,)).fetchall()
+    db.close()
+
+    if running_vms:
+        print(f"\n  Cannot reboot: {len(running_vms)} VM(s) still running:")
+        for vm in running_vms[:10]:  # Show first 10
+            print(f"    - {vm['name_label']} ({vm['power_state']})")
+        if len(running_vms) > 10:
+            print(f"    ... and {len(running_vms) - 10} more")
+        print("\n  Shutdown all VMs first, then retry.")
+        input("\nPress Enter to continue...")
+        return
+
+    # All VMs halted - confirm reboot
+    print(f"\n  All VMs are halted on {conn.host_name}.")
+    confirm = input(f"  Reboot {conn.host_name}? Type 'yes' to confirm: ").strip()
+
+    if confirm.lower() != 'yes':
+        print("  Cancelled.")
+        input("\nPress Enter to continue...")
+        return
+
+    print(f"\n  Rebooting {conn.host_name}...")
+
+    try:
+        result = subprocess.run(
+            ['sshpass', '-p', server['password'], 'ssh', '-o', 'StrictHostKeyChecking=no',
+             f'root@{conn.host}', 'reboot'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        print(f"\n  ✓ Reboot command sent to {conn.host_name}")
+        print("  The host will be unavailable for a few minutes.")
+        input("\nPress Enter to continue...")
+
+    except subprocess.TimeoutExpired:
+        # This is expected - reboot kills the SSH connection
+        print(f"\n  ✓ Reboot command sent to {conn.host_name}")
+        print("  The host will be unavailable for a few minutes.")
+        input("\nPress Enter to continue...")
+    except FileNotFoundError:
+        print("\n  Error: sshpass not installed. Run: sudo apt install sshpass")
+        input("\nPress Enter to continue...")
+    except Exception as e:
+        print(f"\n  Error: {e}")
+        input("\nPress Enter to continue...")
+
+
 def main_menu(host_name=None):
     """Display main menu."""
     title = f"XCP-ng Admin Tool - {host_name}" if host_name else "XCP-ng Admin Tool"
@@ -1906,6 +2590,7 @@ def main_menu(host_name=None):
         ('1', 'VM Operations'),
         ('2', 'Host Overview'),
         ('3', 'Storage Overview'),
+        ('4', 'Host Operations'),
         ('r', 'Refresh cache'),
     ]
     return display_menu(title, options, show_quit=True, show_exit=True)
@@ -2128,6 +2813,10 @@ def _run_main_menu(conn):
             input("Press Enter to continue...")
         elif choice == '3':
             result = storage_workflow(conn)
+            if result == 'exit':
+                return False
+        elif choice == '4':
+            result = host_operations_workflow(conn)
             if result == 'exit':
                 return False
         elif choice == 'r':
