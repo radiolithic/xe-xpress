@@ -1910,7 +1910,7 @@ def storage_workflow(conn):
 
 
 def show_sr_copy_options(sr, conn):
-    """Show options for copying SR configuration."""
+    """Show options for copying SR configuration to other hosts."""
     # Only show copy options for types that make sense to copy
     copyable_types = ['nfs', 'iso', 'smb', 'cifs', 'iscsi', 'lvmoiscsi', 'gfs2']
 
@@ -1928,6 +1928,10 @@ def show_sr_copy_options(sr, conn):
     # Allow editing the config
     edited_config = dict(device_config)
 
+    # Get other servers
+    servers = load_server_config()
+    other_servers = [s for s in servers if s['address'] != conn.host]
+
     while True:
         print(f"\n{'=' * 64}")
         print(f"  Copy SR: {sr['name_label']}")
@@ -1937,14 +1941,15 @@ def show_sr_copy_options(sr, conn):
         # Show current connection config
         if edited_config:
             print(f"\n  Connection parameters:")
-            for i, (key, val) in enumerate(edited_config.items(), 1):
-                print(f"    [{i}] {key}: {val}")
+            keys = list(edited_config.keys())
+            for i, key in enumerate(keys, 1):
+                print(f"    [{i}] {key}: {edited_config[key]}")
         else:
             print(f"\n  No connection parameters found.")
 
-        print(f"\n  [1-{len(edited_config)}] Edit parameter")
+        print()
+        print(f"  [r] Create on target host")
         print(f"  [c] Show xe command")
-        print(f"  [s] Show shell script for multiple hosts")
         print(f"  [q] Back")
 
         choice = input("\nSelect: ").strip().lower()
@@ -1956,7 +1961,6 @@ def show_sr_copy_options(sr, conn):
         try:
             param_idx = int(choice) - 1
             if 0 <= param_idx < len(edited_config):
-                keys = list(edited_config.keys())
                 key = keys[param_idx]
                 print(f"\n  Current {key}: {edited_config[key]}")
                 new_val = input(f"  New {key} (Enter to keep): ").strip()
@@ -1966,24 +1970,91 @@ def show_sr_copy_options(sr, conn):
         except ValueError:
             pass
 
-        if choice == 'c':
+        if choice == 'r':
+            _create_sr_on_target(sr, edited_config, other_servers, conn)
+
+        elif choice == 'c':
             print(f"\n{'─' * 64}")
             print("  XE Command (run on target host):")
             print(f"{'─' * 64}")
             print(f"\n{_get_sr_create_command_with_config(sr, edited_config)}\n")
             input("Press Enter to continue...")
 
-        elif choice == 's':
-            # Get list of other servers from config
-            servers = load_server_config()
-            other_servers = [s['name'] for s in servers if s['address'] != conn.host]
 
-            print(f"\n{'─' * 64}")
-            print("  Shell Script:")
-            print(f"{'─' * 64}")
-            print(_get_sr_create_script_with_config(sr, edited_config, other_servers))
-            print()
-            input("Press Enter to continue...")
+def _create_sr_on_target(sr, device_config, other_servers, conn):
+    """Create SR on a target host via SSH."""
+    if not other_servers:
+        print("\n  No other servers configured.")
+        input("\nPress Enter to continue...")
+        return
+
+    # Check server status
+    print("\n  Checking server status...", end='', flush=True)
+    status = check_servers_status(other_servers)
+    print("\r" + " " * 35 + "\r", end='')
+
+    print(f"\n  Select target host:")
+    for i, s in enumerate(other_servers, 1):
+        online = status.get(s['address'], False)
+        status_str = "" if online else " (OFFLINE)"
+        print(f"    [{i}] {s['name']}{status_str}")
+
+    choice = input("\n  Target: ").strip()
+
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(other_servers):
+            target = other_servers[idx]
+        else:
+            print("  Invalid selection.")
+            return
+    except ValueError:
+        print("  Invalid selection.")
+        return
+
+    # Check if online
+    if not status.get(target['address'], False):
+        print(f"\n  {target['name']} is offline.")
+        input("\nPress Enter to continue...")
+        return
+
+    # Build the xe command
+    xe_cmd = _get_sr_create_command_with_config(sr, device_config)
+
+    print(f"\n  Creating SR on {target['name']}...")
+    print(f"  Command: {xe_cmd[:60]}..." if len(xe_cmd) > 60 else f"  Command: {xe_cmd}")
+
+    confirm = input(f"\n  Proceed? Type 'yes' to confirm: ").strip()
+    if confirm.lower() != 'yes':
+        print("  Cancelled.")
+        return
+
+    try:
+        result = subprocess.run(
+            ['sshpass', '-p', target['password'], 'ssh', '-o', 'StrictHostKeyChecking=no',
+             f'root@{target["address"]}', xe_cmd],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        if result.returncode == 0:
+            sr_uuid = result.stdout.strip()
+            print(f"\n  ✓ SR created successfully!")
+            print(f"  UUID: {sr_uuid}")
+        else:
+            print(f"\n  Error: {result.stderr.strip()}")
+            if result.stdout.strip():
+                print(f"  Output: {result.stdout.strip()}")
+
+    except FileNotFoundError:
+        print("\n  Error: sshpass not installed. Run: sudo apt install sshpass")
+    except subprocess.TimeoutExpired:
+        print("\n  Error: SSH command timed out")
+    except Exception as e:
+        print(f"\n  Error: {e}")
+
+    input("\nPress Enter to continue...")
 
 
 def _get_sr_create_command_with_config(sr, device_config):
