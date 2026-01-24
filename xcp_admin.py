@@ -1291,7 +1291,7 @@ def get_host_overview(host_address):
 
 
 def display_host_overview(conn):
-    """Display host information screen."""
+    """Display compact host information screen."""
     data = get_host_overview(conn.host)
 
     if not data['host']:
@@ -1303,93 +1303,50 @@ def display_host_overview(conn):
     storage = data['storage']
 
     # Parse JSON fields
-    software_version = json.loads(host.get('software_version', '{}'))
-    cpu_info = json.loads(host.get('cpu_info', '{}'))
+    sw = json.loads(host.get('software_version', '{}'))
+    cpu = json.loads(host.get('cpu_info', '{}'))
 
-    print(f"\n{'=' * 60}")
-    print(f"  HOST: {host['name_label']}")
-    print(f"{'=' * 60}")
+    # Header
+    print(f"\n{'=' * 64}")
+    print(f"  HOST: {host['name_label']} ({host['address']})")
+    print(f"{'=' * 64}")
 
-    # Basic info
-    print(f"\n  Hostname:    {host['hostname']}")
-    print(f"  Address:     {host['address']}")
-    print(f"  Enabled:     {'Yes' if host['enabled'] else 'No'}")
+    # Software
+    print(f"  XCP-ng {sw.get('product_version', '?')} | Xen {sw.get('xen', '?')} | Linux {sw.get('linux', '?')}")
 
-    # Version info
-    print(f"\n  {'─' * 56}")
-    print(f"  SOFTWARE")
-    print(f"  {'─' * 56}")
-    xcp_version = software_version.get('product_version', 'Unknown')
-    xen_version = software_version.get('xen', 'Unknown')
-    linux_version = software_version.get('linux', 'Unknown')
-    print(f"  XCP-ng:      {xcp_version}")
-    print(f"  Xen:         {xen_version}")
-    print(f"  Linux:       {linux_version}")
-
-    # CPU info
-    print(f"\n  {'─' * 56}")
-    print(f"  CPU")
-    print(f"  {'─' * 56}")
-    cpu_model = cpu_info.get('modelname', 'Unknown')
-    cpu_count = cpu_info.get('cpu_count', 'Unknown')
-    cpu_sockets = cpu_info.get('socket_count', 'Unknown')
-    print(f"  Model:       {cpu_model}")
-    print(f"  Cores:       {cpu_count} (Sockets: {cpu_sockets})")
+    # CPU - truncate model name if too long
+    cpu_model = cpu.get('modelname', 'Unknown')
+    if len(cpu_model) > 45:
+        cpu_model = cpu_model[:42] + '...'
+    print(f"  CPU:      {cpu_model} ({cpu.get('cpu_count', '?')} cores)")
 
     # Memory
-    print(f"\n  {'─' * 56}")
-    print(f"  MEMORY")
-    print(f"  {'─' * 56}")
     mem_total = format_size(host['memory_total'])
     mem_free = format_size(host['memory_free'])
-    mem_allocated = format_size(vms['memory_allocated']) if vms and vms['memory_allocated'] else '0 B'
-    print(f"  Total:       {mem_total}")
-    print(f"  Free:        {mem_free}")
-    print(f"  Allocated:   {mem_allocated} (to VMs)")
+    mem_alloc = format_size(vms['memory_allocated']) if vms and vms['memory_allocated'] else '0 B'
+    print(f"  Memory:   {mem_free} free / {mem_total} total ({mem_alloc} allocated)")
 
     # VMs
-    print(f"\n  {'─' * 56}")
-    print(f"  VIRTUAL MACHINES")
-    print(f"  {'─' * 56}")
     if vms:
         running = vms['running'] or 0
         halted = vms['halted'] or 0
         total = vms['total'] or 0
         vcpus = vms['vcpus_allocated'] or 0
-        print(f"  Running:     {running}")
-        print(f"  Halted:      {halted}")
-        print(f"  Total:       {total}")
-        print(f"  vCPUs:       {vcpus} allocated")
-    print(f"  Templates:   {data['templates']}")
-    print(f"  Snapshots:   {data['snapshots']}")
+        print(f"  VMs:      {running} running, {halted} halted ({total} total, {vcpus} vCPUs)")
+        print(f"            {data['templates']} templates, {data['snapshots']} snapshots")
 
     # Storage
-    print(f"\n  {'─' * 56}")
-    print(f"  STORAGE")
-    print(f"  {'─' * 56}")
-    if storage:
-        sr_count = storage['count'] or 0
+    if storage and storage['count']:
         sr_total = format_size(storage['total']) if storage['total'] else '0 B'
         sr_used = format_size(storage['used']) if storage['used'] else '0 B'
-        print(f"  Repositories: {sr_count}")
-        print(f"  Total:       {sr_total}")
-        print(f"  Used:        {sr_used}")
+        print(f"  Storage:  {sr_used} / {sr_total} across {storage['count']} repositories")
 
     # Networks
-    print(f"\n  {'─' * 56}")
-    print(f"  NETWORKS")
-    print(f"  {'─' * 56}")
-    print(f"  Count:       {data['networks']}")
+    print(f"  Networks: {data['networks']}")
 
-    # Sync info
+    # Cache info
     if data['sync_info']:
-        print(f"\n  {'─' * 56}")
-        print(f"  CACHE INFO")
-        print(f"  {'─' * 56}")
-        print(f"  Last sync:   {data['sync_info']['last_sync']}")
-        print(f"  Duration:    {data['sync_info']['sync_duration_ms']}ms")
-
-    print()
+        print(f"  Cached:   {data['sync_info']['last_sync']} ({data['sync_info']['sync_duration_ms']}ms)")
 
 
 # ============================================================================
