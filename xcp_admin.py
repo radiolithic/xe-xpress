@@ -49,6 +49,14 @@ _config = {
     }
 }
 
+# Session options (reset each run)
+_session = {
+    'warning_level': 'full',  # 'full', 'confirm', or 'none'
+}
+
+# Persistent marker file for disclaimer acceptance
+DISCLAIMER_ACCEPTED_FILE = Path.home() / '.xcp_admin_accepted'
+
 op_logger = None
 
 
@@ -583,42 +591,54 @@ def select_server(servers):
     if not servers:
         return None
 
-    print(f"\n{'─' * 60}")
-    print("  Select Server")
-    print('─' * 60)
+    status = None  # Cache status check
 
-    # Check server availability in parallel
-    print("  Checking server status...", end='', flush=True)
-    status = check_servers_status(servers)
-    print("\r" + " " * 35 + "\r", end='')  # Clear the checking message
+    while True:
+        warning_level = _session.get('warning_level', 'full')
 
-    print(f"  {'#':<4} {'Name':<15} {'Address':<18} {'Status'}")
-    print('  ' + '-' * 50)
+        print(f"\n{'─' * 60}")
+        if warning_level == 'none':
+            print("  Select Server  [NO CONFIRMATIONS]")
+        else:
+            print("  Select Server")
+        print('─' * 60)
 
-    for i, s in enumerate(servers, 1):
-        online = status.get(s['address'], False)
-        status_str = "online" if online else "OFFLINE"
-        print(f"  {i:<4} {s['name']:<15} {s['address']:<18} {status_str}")
+        # Check server availability in parallel (only on first display)
+        if status is None:
+            print("  Checking server status...", end='', flush=True)
+            status = check_servers_status(servers)
+            print("\r" + " " * 35 + "\r", end='')  # Clear the checking message
 
-    print(f"  [x] Exit")
-    print('─' * 60)
-    choice = input("Select: ").strip()
+        print(f"  {'#':<4} {'Name':<15} {'Address':<18} {'Status'}")
+        print('  ' + '-' * 50)
 
-    if choice.lower() == 'x':
-        return None
+        for i, s in enumerate(servers, 1):
+            online = status.get(s['address'], False)
+            status_str = "online" if online else "OFFLINE"
+            print(f"  {i:<4} {s['name']:<15} {s['address']:<18} {status_str}")
 
-    try:
-        idx = int(choice) - 1
-        if 0 <= idx < len(servers):
-            return servers[idx]
-    except ValueError:
-        # Try matching by name
-        for server in servers:
-            if choice.lower() in server['name'].lower():
-                return server
+        print(f"  [o] Options [warning: {warning_level}]")
+        print(f"  [x] Exit")
+        print('─' * 60)
+        choice = input("Select: ").strip()
 
-    print(f"Invalid selection: {choice}")
-    return None
+        if choice.lower() == 'x':
+            return None
+        elif choice.lower() == 'o':
+            options_menu()
+            continue
+
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(servers):
+                return servers[idx]
+        except ValueError:
+            # Try matching by name
+            for server in servers:
+                if choice.lower() in server['name'].lower():
+                    return server
+
+        print(f"Invalid selection: {choice}")
 
 
 # ============================================================================
@@ -917,16 +937,17 @@ def vm_revert_snapshot(conn, vm_ref, vm_info, dry_run=False):
     if dry_run:
         print(f"\n[DRY RUN] Would revert '{vm_info['name']}' to snapshot '{snap['name']}'")
         return True
-    
-    # Confirm
-    print(f"\n⚠ WARNING: This will revert '{vm_info['name']}' to snapshot '{snap['name']}'")
-    print("  All changes since the snapshot will be lost!")
-    confirm = input("Type 'yes' to confirm: ").strip()
-    
-    if confirm.lower() != 'yes':
-        print("Cancelled.")
-        return False
-    
+
+    # Confirm (unless warning_level is 'none')
+    warning_level = _session.get('warning_level', 'full')
+    if warning_level != 'none':
+        print(f"\n⚠ WARNING: This will revert '{vm_info['name']}' to snapshot '{snap['name']}'")
+        print("  All changes since the snapshot will be lost!")
+        confirm = input("Type 'yes' to confirm: ").strip()
+        if confirm.lower() != 'yes':
+            print("Cancelled.")
+            return False
+
     print(f"\nReverting to snapshot '{snap['name']}'...")
     conn.api.VM.revert(snap['ref'])
     
@@ -964,15 +985,16 @@ def vm_delete_snapshot(conn, vm_ref, vm_info, dry_run=False):
     if dry_run:
         print(f"\n[DRY RUN] Would delete snapshot '{snap['name']}'")
         return True
-    
-    # Confirm
-    print(f"\n⚠ Delete snapshot '{snap['name']}'?")
-    confirm = input("Type 'yes' to confirm: ").strip()
-    
-    if confirm.lower() != 'yes':
-        print("Cancelled.")
-        return False
-    
+
+    # Confirm (unless warning_level is 'none')
+    warning_level = _session.get('warning_level', 'full')
+    if warning_level != 'none':
+        print(f"\n⚠ Delete snapshot '{snap['name']}'?")
+        confirm = input("Type 'yes' to confirm: ").strip()
+        if confirm.lower() != 'yes':
+            print("Cancelled.")
+            return False
+
     print(f"\nDeleting snapshot '{snap['name']}'...")
     conn.api.VM.destroy(snap['ref'])
     
@@ -1093,15 +1115,16 @@ def resize_vdi(conn, vm_ref, vm_info, dry_run=False):
     if dry_run:
         print(f"\n[DRY RUN] Would resize disk from {format_size(current_size)} to {format_size(new_size)}")
         return True
-    
-    # Warn about VM state
-    if vm_info['power_state'] == 'Running':
+
+    # Warn about VM state (unless warning_level is 'none')
+    warning_level = _session.get('warning_level', 'full')
+    if warning_level != 'none' and vm_info['power_state'] == 'Running':
         print("\n⚠ WARNING: VM is running. It's safer to shut it down first.")
         confirm = input("Continue anyway? (yes/no): ").strip()
         if confirm.lower() != 'yes':
             print("Cancelled.")
             return False
-    
+
     print(f"\nResizing disk from {format_size(current_size)} to {format_size(new_size)}...")
     conn.api.VDI.resize(disk['vdi_ref'], str(new_size))
     
@@ -1271,15 +1294,16 @@ def remove_vif(conn, vm_ref, vm_info, dry_run=False):
     if dry_run:
         print(f"\n[DRY RUN] Would remove VIF device {iface['device']} ({iface['network_name']})")
         return True
-    
-    # Confirm
-    print(f"\n⚠ Remove interface {iface['device']} ({iface['network_name']})?")
-    confirm = input("Type 'yes' to confirm: ").strip()
-    
-    if confirm.lower() != 'yes':
-        print("Cancelled.")
-        return False
-    
+
+    # Confirm (unless warning_level is 'none')
+    warning_level = _session.get('warning_level', 'full')
+    if warning_level != 'none':
+        print(f"\n⚠ Remove interface {iface['device']} ({iface['network_name']})?")
+        confirm = input("Type 'yes' to confirm: ").strip()
+        if confirm.lower() != 'yes':
+            print("Cancelled.")
+            return False
+
     print(f"\nRemoving interface...")
     conn.api.VIF.destroy(iface['vif_ref'])
     
@@ -1624,13 +1648,15 @@ def _show_pbd_update_commands(sr, old_config, new_config, attached, conn):
         if choice == 'q' or choice == '':
             return None
         elif choice == 'r':
-            confirm = input("\n  Apply changes via SSH? Type 'yes' to confirm: ").strip()
-            if confirm.lower() == 'yes':
-                success = _apply_pbd_update_ssh(sr, new_config, attached, conn)
-                if success:
-                    return 'applied'
-            else:
-                print("  Cancelled.")
+            warning_level = _session.get('warning_level', 'full')
+            if warning_level != 'none':
+                confirm = input("\n  Apply changes via SSH? Type 'yes' to confirm: ").strip()
+                if confirm.lower() != 'yes':
+                    print("  Cancelled.")
+                    continue
+            success = _apply_pbd_update_ssh(sr, new_config, attached, conn)
+            if success:
+                return 'applied'
 
 
 def _apply_pbd_update_ssh(sr, new_config, attached, conn):
@@ -2024,10 +2050,12 @@ def _create_sr_on_target(sr, device_config, other_servers, conn):
     print(f"\n  Creating SR on {target['name']}...")
     print(f"  Command: {xe_cmd[:60]}..." if len(xe_cmd) > 60 else f"  Command: {xe_cmd}")
 
-    confirm = input(f"\n  Proceed? Type 'yes' to confirm: ").strip()
-    if confirm.lower() != 'yes':
-        print("  Cancelled.")
-        return
+    warning_level = _session.get('warning_level', 'full')
+    if warning_level != 'none':
+        confirm = input(f"\n  Proceed? Type 'yes' to confirm: ").strip()
+        if confirm.lower() != 'yes':
+            print("  Cancelled.")
+            return
 
     try:
         result = subprocess.run(
@@ -2192,18 +2220,25 @@ def vm_delete(conn, vm_ref, vm_info, dry_run=False):
         print(f"\n[DRY RUN] Would delete VM '{vm_info['name']}' and {len(disks)} disk(s)")
         return True
 
-    # Double confirmation for destructive operation
-    print(f"\n⚠ WARNING: This will permanently delete:")
-    print(f"    - VM: {vm_info['name']}")
-    print(f"    - {len(disks)} attached disk(s)")
-    print(f"\n  This action CANNOT be undone!")
+    # Double confirmation for destructive operation (unless warning_level is 'none')
+    warning_level = _session.get('warning_level', 'full')
+    if warning_level != 'none':
+        print(f"\n⚠ WARNING: This will permanently delete:")
+        print(f"    - VM: {vm_info['name']}")
+        print(f"    - {len(disks)} attached disk(s)")
+        print(f"\n  This action CANNOT be undone!")
 
-    print(f"\nType the VM name to confirm deletion:")
-    confirm_name = input("VM name: ").strip()
-
-    if confirm_name != vm_info['name']:
-        print("Name does not match. Cancelled.")
-        return False
+        if warning_level == 'full':
+            print(f"\nType the VM name to confirm deletion:")
+            confirm_name = input("VM name: ").strip()
+            if confirm_name != vm_info['name']:
+                print("Name does not match. Cancelled.")
+                return False
+        else:  # 'confirm'
+            confirm = input("\nDelete? Type 'yes' to confirm: ").strip()
+            if confirm.lower() != 'yes':
+                print("Cancelled.")
+                return False
 
     print(f"\nDeleting VM '{vm_info['name']}'...")
 
@@ -2360,21 +2395,38 @@ def vm_operations_menu(vm_info):
 
 
 def run_with_dry_run(operation_func, conn, vm_ref, vm_info, **kwargs):
-    """Run an operation with optional dry-run."""
-    print("\nPreview operation first (dry-run)? [Y/n]:")
-    dry_run = input("Dry run? ").strip().lower()
-    
-    if dry_run in ('', 'y', 'yes'):
-        operation_func(conn, vm_ref, vm_info, dry_run=True, **kwargs)
-        
-        print("\nProceed with actual operation? [y/N]:")
-        proceed = input("Execute? ").strip().lower()
-        
+    """Run an operation with optional dry-run, respecting warning level."""
+    warning_level = _session.get('warning_level', 'full')
+
+    if warning_level == 'none':
+        # No warnings - immediate execution
+        return operation_func(conn, vm_ref, vm_info, dry_run=False, **kwargs)
+
+    elif warning_level == 'confirm':
+        # Simple confirmation only
+        print(f"\nExecute operation on '{vm_info['name']}'? [y/N]:")
+        proceed = input("Confirm: ").strip().lower()
         if proceed not in ('y', 'yes'):
             print("Cancelled.")
             return False
-    
-    return operation_func(conn, vm_ref, vm_info, dry_run=False, **kwargs)
+        return operation_func(conn, vm_ref, vm_info, dry_run=False, **kwargs)
+
+    else:  # 'full' - default
+        # Full dry-run workflow
+        print("\nPreview operation first (dry-run)? [Y/n]:")
+        dry_run = input("Dry run? ").strip().lower()
+
+        if dry_run in ('', 'y', 'yes'):
+            operation_func(conn, vm_ref, vm_info, dry_run=True, **kwargs)
+
+            print("\nProceed with actual operation? [y/N]:")
+            proceed = input("Execute? ").strip().lower()
+
+            if proceed not in ('y', 'yes'):
+                print("Cancelled.")
+                return False
+
+        return operation_func(conn, vm_ref, vm_info, dry_run=False, **kwargs)
 
 
 def vm_workflow(conn):
@@ -2539,11 +2591,13 @@ done
         for m in mounted:
             print(f"    - {m['vm']}: {m['iso']}")
 
-        confirm = input(f"\n  Eject all {len(mounted)} ISOs? Type 'yes' to confirm: ").strip()
-        if confirm.lower() != 'yes':
-            print("  Cancelled.")
-            input("\nPress Enter to continue...")
-            return
+        warning_level = _session.get('warning_level', 'full')
+        if warning_level != 'none':
+            confirm = input(f"\n  Eject all {len(mounted)} ISOs? Type 'yes' to confirm: ").strip()
+            if confirm.lower() != 'yes':
+                print("  Cancelled.")
+                input("\nPress Enter to continue...")
+                return
 
         # Eject all
         vbd_list = ' '.join(m['vbd'] for m in mounted)
@@ -2617,14 +2671,15 @@ def reboot_hypervisor(conn):
         input("\nPress Enter to continue...")
         return
 
-    # All VMs halted - confirm reboot
-    print(f"\n  All VMs are halted on {conn.host_name}.")
-    confirm = input(f"  Reboot {conn.host_name}? Type 'yes' to confirm: ").strip()
-
-    if confirm.lower() != 'yes':
-        print("  Cancelled.")
-        input("\nPress Enter to continue...")
-        return
+    # All VMs halted - confirm reboot (unless warning_level is 'none')
+    warning_level = _session.get('warning_level', 'full')
+    if warning_level != 'none':
+        print(f"\n  All VMs are halted on {conn.host_name}.")
+        confirm = input(f"  Reboot {conn.host_name}? Type 'yes' to confirm: ").strip()
+        if confirm.lower() != 'yes':
+            print("  Cancelled.")
+            input("\nPress Enter to continue...")
+            return
 
     print(f"\n  Rebooting {conn.host_name}...")
 
@@ -2656,15 +2711,73 @@ def reboot_hypervisor(conn):
 
 def main_menu(host_name=None):
     """Display main menu."""
+    warning_level = _session.get('warning_level', 'full')
     title = f"XCP-ng Admin Tool - {host_name}" if host_name else "XCP-ng Admin Tool"
+    if warning_level == 'none':
+        title += "  [NO CONFIRMATIONS]"
     options = [
         ('1', 'VM Operations'),
         ('2', 'Host Overview'),
         ('3', 'Storage Overview'),
         ('4', 'Host Operations'),
+        ('o', f'Options [warning: {warning_level}]'),
         ('r', 'Refresh cache'),
     ]
     return display_menu(title, options, show_quit=True, show_exit=True)
+
+
+def options_menu():
+    """Session options menu."""
+    while True:
+        warning_level = _session.get('warning_level', 'full')
+        disclaimer_disabled = DISCLAIMER_ACCEPTED_FILE.exists()
+
+        print(f"\n{'─' * 64}")
+        print(f"  Session Options")
+        print('─' * 64)
+
+        print(f"\n  Warning Level: [{warning_level}]")
+        print(f"    full    - Dry-run preview, confirm execution")
+        print(f"    confirm - Simple yes/no confirmation only")
+        print(f"    none    - No confirmations, immediate execution")
+
+        print(f"\n  Startup Disclaimer: [{'disabled' if disclaimer_disabled else 'enabled'}]")
+
+        print(f"\n  [1] Set warning level")
+        print(f"  [2] Toggle startup disclaimer")
+        print(f"  [q] Back")
+        print('─' * 64)
+
+        choice = input("Select: ").strip().lower()
+
+        if choice == 'q' or choice == '':
+            return
+        elif choice == '1':
+            print(f"\n  Current: {warning_level}")
+            print("  Options: full, confirm, none")
+            new_level = input("  New level: ").strip().lower()
+            if new_level in ('full', 'confirm', 'none'):
+                _session['warning_level'] = new_level
+                print(f"  ✓ Warning level set to '{new_level}'")
+            elif new_level:
+                print(f"  Invalid option: '{new_level}'")
+        elif choice == '2':
+            if disclaimer_disabled:
+                # Re-enable disclaimer
+                try:
+                    DISCLAIMER_ACCEPTED_FILE.unlink()
+                    print("  ✓ Startup disclaimer enabled (will show on next run)")
+                except Exception as e:
+                    print(f"  Error: {e}")
+            else:
+                # Disable disclaimer
+                try:
+                    DISCLAIMER_ACCEPTED_FILE.write_text(
+                        f"Disclaimer accepted on {datetime.now().isoformat()}\n"
+                    )
+                    print("  ✓ Startup disclaimer disabled for future runs")
+                except Exception as e:
+                    print(f"  Error: {e}")
 
 
 # ============================================================================
@@ -2755,6 +2868,10 @@ def create_default_config(filename='xcp_admin_config.json'):
 
 def show_disclaimer():
     """Display legal disclaimer and require acceptance."""
+    # Check if previously accepted and disabled
+    if DISCLAIMER_ACCEPTED_FILE.exists():
+        return
+
     print("\n" + "=" * 70)
     print("  XCP-NG ADMIN TOOL - PRE-ALPHA SOFTWARE")
     print("=" * 70)
@@ -2931,6 +3048,8 @@ def _run_main_menu(conn):
             result = host_operations_workflow(conn)
             if result == 'exit':
                 return False
+        elif choice == 'o':
+            options_menu()
         elif choice == 'r':
             print("\nRefreshing cache from host...")
             try:
