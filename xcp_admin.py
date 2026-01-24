@@ -2753,6 +2753,44 @@ def create_default_config(filename='xcp_admin_config.json'):
         return False
 
 
+def show_disclaimer():
+    """Display legal disclaimer and require acceptance."""
+    print("\n" + "=" * 70)
+    print("  XCP-NG ADMIN TOOL - PRE-ALPHA SOFTWARE")
+    print("=" * 70)
+    print("""
+  IMPORTANT NOTICE - PLEASE READ CAREFULLY
+
+  This software is provided "AS IS" in PRE-ALPHA state, without warranty
+  of any kind, express or implied, including but not limited to the
+  warranties of merchantability, fitness for a particular purpose, and
+  noninfringement.
+
+  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+  CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+  TORT OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE
+  SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  This tool performs administrative operations on XCP-ng hypervisors
+  including but not limited to: starting/stopping VMs, modifying storage,
+  rebooting hosts, and deleting resources. Improper use may result in
+  DATA LOSS, SERVICE INTERRUPTION, or other IRREVERSIBLE DAMAGE.
+
+  BY CONTINUING, YOU ACKNOWLEDGE THAT:
+  - You understand this is experimental, pre-alpha software
+  - You accept all risks associated with its use
+  - You will not hold the authors liable for any damages
+  - You have appropriate backups and recovery procedures in place
+""")
+    print("=" * 70)
+
+    response = input("\n  Type 'I ACCEPT' to continue: ").strip()
+    if response != 'I ACCEPT':
+        print("\n  You must accept the terms to continue. Exiting.")
+        sys.exit(0)
+    print()
+
+
 def main():
     """Main entry point."""
     args = parse_arguments()
@@ -2761,7 +2799,10 @@ def main():
         create_default_config(args.config)
         return
 
-    print("\n" + "=" * 60)
+    # Show disclaimer and require acceptance
+    show_disclaimer()
+
+    print("=" * 60)
     print("  XCP-NG ADMIN TOOL")
     print("=" * 60)
 
