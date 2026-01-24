@@ -1,0 +1,2 @@
+# XCP-ng Admin Tool dependencies
+XenAPI>=23.0.0
