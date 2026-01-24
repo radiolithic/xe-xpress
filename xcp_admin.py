@@ -1600,6 +1600,7 @@ def main_menu(host_name=None):
         ('2', 'Host Overview'),
         ('3', 'Storage Overview'),
         ('r', 'Refresh cache'),
+        ('s', 'Switch server'),
     ]
     return display_menu(title, options, show_back=False)
 
@@ -1715,17 +1716,13 @@ def main():
 
     # Load servers from xcpng.config
     servers = load_server_config()
-
-    # Determine connection parameters
-    host = None
-    host_name = None
     user = args.user or _config.get('default_user', 'root')
-    password = None
 
+    # If --host specified, use single-server mode (no server selection loop)
     if args.host:
-        # Host specified via command line
         host = args.host
         host_name = args.host
+        password = None
         # Check if this host is in our config for the password
         for s in servers:
             if s['address'] == args.host or s['name'] == args.host:
@@ -1736,71 +1733,102 @@ def main():
         if not password:
             print(f"\nConnecting to {host} as {user}")
             password = getpass("Password: ")
-    elif servers:
-        # Select from config
-        server = select_server(servers)
-        if not server:
-            print("\nNo server selected. Exiting.")
-            return
-        host = server['address']
-        host_name = server['name']
-        password = server['password']
-    else:
-        # No config, no args - prompt for everything
-        print("\nNo xcpng.config found and no --host specified.")
-        print("Enter XCP-ng host address:")
-        host = input("Host: ").strip()
-        if not host:
-            print("No host specified.")
-            return
-        host_name = host
-        print(f"\nConnecting to {host} as {user}")
-        password = getpass("Password: ")
 
-    # Connect
+        conn = _connect_and_sync(host, user, password, host_name)
+        if not conn:
+            return
+        try:
+            _run_main_menu(conn)
+        finally:
+            conn.close()
+            print("\n✓ Disconnected. Goodbye!")
+        return
+
+    # Server selection loop
+    while True:
+        if servers:
+            server = select_server(servers)
+            if not server:
+                print("\nGoodbye!")
+                return
+            host = server['address']
+            host_name = server['name']
+            password = server['password']
+        else:
+            # No config - prompt for everything
+            print("\nNo xcpng.config found.")
+            print("Enter XCP-ng host address (or 'q' to quit):")
+            host = input("Host: ").strip()
+            if not host or host.lower() == 'q':
+                print("\nGoodbye!")
+                return
+            host_name = host
+            print(f"\nConnecting to {host} as {user}")
+            password = getpass("Password: ")
+
+        conn = _connect_and_sync(host, user, password, host_name)
+        if not conn:
+            # Connection failed, let user try another server
+            input("Press Enter to continue...")
+            continue
+
+        try:
+            switch_server = _run_main_menu(conn)
+        finally:
+            conn.close()
+            print(f"\n✓ Disconnected from {host_name}")
+
+        if not switch_server:
+            # User chose quit, not switch server
+            print("\nGoodbye!")
+            return
+
+
+def _connect_and_sync(host, user, password, host_name):
+    """Connect to a host and sync cache. Returns connection or None on failure."""
     print(f"\nConnecting to {host_name} ({host})...")
     try:
         conn = XCPConnection(host, user, password, host_name=host_name)
         print(f"✓ Connected to {host_name}")
     except Exception as e:
         print(f"Connection failed: {e}")
-        return
+        return None
 
-    # Auto-sync on connect
     print("\nSyncing infrastructure data to cache...")
     try:
         conn.sync_to_cache()
     except Exception as e:
-        print(f"⚠ Warning: Cache sync failed: {e}")
+        print(f"Warning: Cache sync failed: {e}")
         print("  Some features may show stale data.")
 
-    # Main loop
-    try:
-        while True:
-            choice = main_menu(host_name=conn.host_name)
+    return conn
 
-            if choice == 'q':
-                break
-            elif choice == '1':
-                vm_workflow(conn)
-            elif choice == '2':
-                display_host_overview(conn)
-                input("Press Enter to continue...")
-            elif choice == '3':
-                print("\n[Storage overview not yet implemented]")
-                input("Press Enter...")
-            elif choice == 'r':
-                print("\nRefreshing cache from host...")
-                try:
-                    conn.sync_to_cache()
-                except Exception as e:
-                    print(f"Refresh failed: {e}")
-            else:
-                print(f"\nInvalid choice: '{choice}'")
 
-    finally:
-        conn.close()
-        print("\n✓ Disconnected. Goodbye!")
+def _run_main_menu(conn):
+    """Run the main menu loop. Returns True if user wants to switch servers, False to quit."""
+    while True:
+        choice = main_menu(host_name=conn.host_name)
+
+        if choice == 'q':
+            return False  # Quit program
+        elif choice == 's':
+            return True   # Switch server
+        elif choice == '1':
+            vm_workflow(conn)
+        elif choice == '2':
+            display_host_overview(conn)
+            input("Press Enter to continue...")
+        elif choice == '3':
+            print("\n[Storage overview not yet implemented]")
+            input("Press Enter...")
+        elif choice == 'r':
+            print("\nRefreshing cache from host...")
+            try:
+                conn.sync_to_cache()
+            except Exception as e:
+                print(f"Refresh failed: {e}")
+        else:
+            print(f"\nInvalid choice: '{choice}'")
 
 
 if __name__ == "__main__":
