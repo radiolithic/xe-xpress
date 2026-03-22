@@ -126,7 +126,7 @@ def load_server_config(config_file='xcpng.config'):
 
     Config file format:
     [Servers]
-    <ip>\t<name>\t<password>
+    <ip>  <name>  <password>
 
     Returns list of dicts: [{'address': '...', 'name': '...', 'password': '...'}]
     """
@@ -147,7 +147,7 @@ def load_server_config(config_file='xcpng.config'):
                 if line.startswith('[') and in_servers:
                     break
                 if in_servers and line and not line.startswith('#'):
-                    parts = line.split('\t')
+                    parts = line.split()
                     if len(parts) >= 3:
                         servers.append({
                             'address': parts[0],
