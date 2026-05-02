@@ -1876,6 +1876,11 @@ def get_sr_create_script(sr, target_servers=None):
 
 def storage_workflow(conn):
     """Storage operations workflow. Returns 'exit' if user wants to exit program."""
+    try:
+        conn.sync_to_cache()
+    except Exception as e:
+        print(f"Warning: Cache refresh failed: {e}")
+        print("  Cached data may be stale; proceed with caution.")
     while True:
         srs = get_storage_repositories(conn.host)
 
@@ -2501,6 +2506,11 @@ def vm_workflow(conn):
 
 def host_operations_workflow(conn):
     """Host-level operations workflow. Returns 'exit' if user wants to exit program."""
+    try:
+        conn.sync_to_cache()
+    except Exception as e:
+        print(f"Warning: Cache refresh failed: {e}")
+        print("  Cached data may be stale; proceed with caution.")
     while True:
         print(f"\n{'─' * 64}")
         print(f"  Host Operations - {conn.host_name}")
